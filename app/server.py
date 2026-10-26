@@ -1194,8 +1194,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (document.hidden) stopJoyHold();
     });
 
-    // Auto-refresh telemetry every 250ms
-    setInterval(updateTelemetry, 250);
+    // Auto-refresh telemetry every 500ms (balanced for low CPU and responsive UI)
+    setInterval(updateTelemetry, 500);
     updateTelemetry();
   </script>
 </body>
@@ -1514,7 +1514,7 @@ def create_app(runtime: RobotRuntime, control_token: Optional[str] = None) -> Fa
                         if max_frames > 0 and frames_sent >= max_frames:
                             break
 
-                    await asyncio.sleep(0.066)  # ~15 FPS
+                    await asyncio.sleep(0.10)  # ~10 FPS (bounded to prevent thermal throttling)
             except (asyncio.CancelledError, GeneratorExit):
                 logger.debug("MJPEG stream aborted cleanly by client.")
             except Exception as exc:

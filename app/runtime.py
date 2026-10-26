@@ -512,9 +512,9 @@ class RobotRuntime:
                 time.sleep(0.05)
 
     def _vision_worker(self) -> None:
-        """Background optical perception thread running periodic YOLO inference (~1 Hz during idle)."""
-        detect_freq = getattr(self.config.vision, "detect_frequency_hz", 1.0)
-        target_sleep = max(0.5, 1.0 / max(0.2, float(detect_freq)))
+        """Background optical perception thread running periodic YOLO inference (~0.5 Hz during idle)."""
+        detect_freq = getattr(self.config.vision, "detect_frequency_hz", 0.5)
+        target_sleep = max(2.0, 1.0 / max(0.1, float(detect_freq)))
 
         while not self._stop_event.is_set():
             # If an autonomous mission is active, step_mission handles optical detection;

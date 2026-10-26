@@ -174,7 +174,7 @@ class ONNXYOLODetector(DetectorInterface):
 
         # Configure session options optimized for Raspberry Pi / CPU execution
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 4  # 4 cores on Raspberry Pi 4 Cortex-A72
+        opts.intra_op_num_threads = 2  # Bound to 2 cores on Raspberry Pi 4 to prevent thermal throttling
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         try:
