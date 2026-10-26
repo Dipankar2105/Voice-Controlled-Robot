@@ -261,14 +261,27 @@ class RobotStateMachine:
 
         # 5. Manual Directional Movement Commands
         if cmd.intent == CommandIntent.MOVEMENT:
-            if self._state not in (RobotState.IDLE_LISTENING, RobotState.MANUAL_MOVEMENT):
+            if self._state not in (
+                RobotState.IDLE_LISTENING,
+                RobotState.MANUAL_MOVEMENT,
+                RobotState.BLOCKED,
+                RobotState.CANCELLED,
+                RobotState.TARGET_REACHED,
+                RobotState.TARGET_NOT_FOUND,
+            ):
                 logger.warning("Manual movement rejected: Robot is in state %s", self._state.value)
                 return False
             return self._execute_manual_movement(cmd.action, cmd.speed or DEFAULT_MANUAL_SPEED)
 
         # 6. Autonomous Search Command
         if cmd.intent == CommandIntent.SEARCH and cmd.action == CommandAction.SEARCH_TARGET:
-            if self._state != RobotState.IDLE_LISTENING:
+            if self._state not in (
+                RobotState.IDLE_LISTENING,
+                RobotState.CANCELLED,
+                RobotState.TARGET_REACHED,
+                RobotState.TARGET_NOT_FOUND,
+                RobotState.BLOCKED,
+            ):
                 logger.warning("Search command rejected: Robot is currently in state %s", self._state.value)
                 return False
             return self.start_search_mission(cmd.target_class, cmd.target_alias)
@@ -289,6 +302,12 @@ class RobotStateMachine:
         if not self.motors:
             self._transition_to(RobotState.IDLE_LISTENING, "Mock movement completed.")
             return True
+
+        if hasattr(self.motors, "is_enabled") and not self.motors.is_enabled:
+            try:
+                self.motors.enable(True)
+            except Exception as exc:
+                logger.error("Failed to enable motors: %s", exc)
 
         raw_pulse = getattr(self.config.motion, "manual_pulse_sec", 1.25) if hasattr(self.config, "motion") else 1.25
         pulse_sec = max(0.05, min(2.00, float(raw_pulse)))

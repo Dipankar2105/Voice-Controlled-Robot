@@ -619,3 +619,37 @@ def test_manual_forward_pulse_completes_and_stops_motors(fsm: RobotStateMachine)
     assert fsm.state == RobotState.IDLE_LISTENING
     assert fsm.motors.current_speeds == (0.0, 0.0)
 
+
+def test_blocked_state_accepts_backward_recovery(fsm: RobotStateMachine):
+    """When robot is in BLOCKED state, manual backward command executes and returns to IDLE."""
+    fsm._state = RobotState.BLOCKED
+    fsm.config = replace(fsm.config, motion=replace(fsm.config.motion, manual_pulse_sec=0.05))
+
+    cmd = RobotCommand(
+        raw_transcript="backward", normalized_text="backward",
+        intent=CommandIntent.MOVEMENT, action=CommandAction.MOVE_BACKWARD,
+        speed=0.5, timestamp=time.time(),
+    )
+    accepted = fsm.handle_command(cmd)
+    assert accepted is True
+    assert fsm.state == RobotState.IDLE_LISTENING
+    assert fsm.motors.current_speeds == (0.0, 0.0)
+
+
+def test_terminal_states_accept_manual_commands(fsm: RobotStateMachine):
+    """Target reached/not found and cancelled states permit subsequent manual movement."""
+    fsm.config = replace(fsm.config, motion=replace(fsm.config.motion, manual_pulse_sec=0.05))
+    fsm.distance_sensor.set_distance(100.0)
+
+    for term_state in (RobotState.TARGET_NOT_FOUND, RobotState.TARGET_REACHED, RobotState.CANCELLED):
+        fsm._state = term_state
+        cmd = RobotCommand(
+            raw_transcript="forward", normalized_text="forward",
+            intent=CommandIntent.MOVEMENT, action=CommandAction.MOVE_FORWARD,
+            speed=0.5, timestamp=time.time(),
+        )
+        accepted = fsm.handle_command(cmd)
+        assert accepted is True
+        assert fsm.state == RobotState.IDLE_LISTENING
+
+

@@ -667,6 +667,7 @@ class RobotRuntime:
                     RobotState.CANCELLED,
                     RobotState.TARGET_REACHED,
                     RobotState.TARGET_NOT_FOUND,
+                    RobotState.BLOCKED,
                 ):
                     self.fsm._transition_to(RobotState.MANUAL_MOVEMENT, f"Mock joystick: {act}")
                 return True, f"Mock joystick {act} accepted"
@@ -692,6 +693,7 @@ class RobotRuntime:
                     RobotState.CANCELLED,
                     RobotState.TARGET_REACHED,
                     RobotState.TARGET_NOT_FOUND,
+                    RobotState.BLOCKED,
                 ):
                     self.fsm._transition_to(RobotState.MANUAL_MOVEMENT, f"Joystick motion: {act}")
 
