@@ -638,6 +638,11 @@ class RobotRuntime:
         ):
             self.fsm.cancel_mission("Interrupted by manual joystick teleoperation")
 
+        # Recover from non-hardware FAULT (e.g. TARGET_LOST) upon manual joystick actuation
+        if self.fsm and self.fsm.state == RobotState.FAULT and getattr(self.fsm, "active_fault", None) in (FaultCode.TARGET_LOST, FaultCode.OK):
+            self.fsm._active_fault = FaultCode.OK
+            self.fsm._transition_to(RobotState.IDLE_LISTENING, "Joystick recovery from TARGET_LOST.")
+
         # Clamp speed
         max_spd = float(getattr(self.config.motion, "max_speed", 1.0))
         base_spd = float(getattr(self.config.motion, "manual_speed", 0.75))

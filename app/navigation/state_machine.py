@@ -261,6 +261,11 @@ class RobotStateMachine:
 
         # 5. Manual Directional Movement Commands
         if cmd.intent == CommandIntent.MOVEMENT:
+            # If robot is in FAULT due to TARGET_LOST, clear the optical fault and accept manual intervention
+            if self._state == RobotState.FAULT and self._active_fault in (FaultCode.TARGET_LOST, FaultCode.OK):
+                self._active_fault = FaultCode.OK
+                self._transition_to(RobotState.IDLE_LISTENING, "Recovered from TARGET_LOST via manual command.")
+
             if self._state not in (
                 RobotState.IDLE_LISTENING,
                 RobotState.MANUAL_MOVEMENT,
@@ -275,6 +280,11 @@ class RobotStateMachine:
 
         # 6. Autonomous Search Command
         if cmd.intent == CommandIntent.SEARCH and cmd.action == CommandAction.SEARCH_TARGET:
+            # If robot is in FAULT due to TARGET_LOST, clear the optical fault and accept new search
+            if self._state == RobotState.FAULT and self._active_fault in (FaultCode.TARGET_LOST, FaultCode.OK):
+                self._active_fault = FaultCode.OK
+                self._transition_to(RobotState.IDLE_LISTENING, "Recovered from TARGET_LOST via new search.")
+
             if self._state not in (
                 RobotState.IDLE_LISTENING,
                 RobotState.CANCELLED,
