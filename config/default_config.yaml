@@ -66,7 +66,7 @@ vision:
   nms_threshold: 0.45
   deadband_pixels: 40
   target_reached_area: 35000
-  detect_frequency_hz: 6
+  detect_frequency_hz: 1
 
 audio:
   model_dir: "models/voice/vosk-model"

@@ -99,7 +99,7 @@ class RobotStateMachine:
         self.max_consecutive_target_loss = self.config.safety.max_consecutive_target_loss
         self.search_scan_sec = self.config.motion.search_scan_duration_sec
         self.calibrated_360_duration_sec = self.config.motion.calibrated_360_duration_sec
-        self.ultrasonic_protection_enabled: bool = False
+        self.ultrasonic_protection_enabled: bool = True
 
         # Transition to IDLE_LISTENING upon successful construction
         self._transition_to(RobotState.IDLE_LISTENING, "System initialized and ready.")
@@ -462,6 +462,7 @@ class RobotStateMachine:
         # STATE: CENTERING (Align bounding-box center with frame center)
         # ===================================================================
         if self._state == RobotState.CENTERING:
+            centering_reading = None
             if self.ultrasonic_protection_enabled:
                 if not self.distance_sensor:
                     self._active_fault = FaultCode.SENSOR_TIMEOUT
@@ -481,6 +482,11 @@ class RobotStateMachine:
                         or centering_reading.distance_cm <= self.config.safety.obstacle_blocked_cm):
                     self._transition_to(RobotState.BLOCKED, "Centering refused: forward obstacle is inside blocked zone.")
                     return self._state
+            elif self.distance_sensor:
+                try:
+                    centering_reading = self.distance_sensor.get_reading()
+                except Exception:
+                    centering_reading = None
 
             time.sleep(DEFAULT_SETTLING_DELAY_SEC)
             det = self._detect_target_in_frame(target_class)
@@ -505,7 +511,12 @@ class RobotStateMachine:
                 self._transition_to(RobotState.APPROACHING, f"Target '{target_class}' centered; commencing approach.")
                 return self._state
 
-            if centering_reading.distance_cm <= self.target_stop_distance_cm:
+            if (
+                self.ultrasonic_protection_enabled
+                and centering_reading is not None
+                and centering_reading.distance_cm is not None
+                and centering_reading.distance_cm <= self.target_stop_distance_cm
+            ):
                 self.motors.stop()
                 self._transition_to(RobotState.BLOCKED, "Target is off-centre inside stop zone; refusing a blind in-place turn without side sensors.")
                 return self._state
@@ -609,20 +620,17 @@ class RobotStateMachine:
 
             # Target arrival is allowed only in the warning/clear band, outside
             # BLOCKED/CRITICAL. Bounding-box area is never used as distance.
-            if distance_cm is not None and distance_cm <= self.target_stop_distance_cm:
-                self._context.terminal_message = (
-                    f"Requested target centred; ultrasonic distance {distance_cm:.1f} cm "
-                    f"is within safe stop threshold {self.target_stop_distance_cm:.1f} cm."
-                )
-                self._transition_to(RobotState.TARGET_REACHED, self._context.terminal_message)
-                return self._state
-
-            if not self.ultrasonic_protection_enabled and det.area >= 35000:
-                self._context.terminal_message = (
-                    f"Requested target centred and reached optically (bounding box area: {det.area:.0f}px)."
-                )
-                self._transition_to(RobotState.TARGET_REACHED, self._context.terminal_message)
-                return self._state
+            if distance_cm is not None:
+                if distance_cm <= self.config.safety.obstacle_blocked_cm:
+                    self._transition_to(RobotState.BLOCKED, f"Obstacle detected ahead at {distance_cm:.1f} cm.")
+                    return self._state
+                if distance_cm <= self.target_stop_distance_cm:
+                    self._context.terminal_message = (
+                        f"Requested target centred; ultrasonic distance {distance_cm:.1f} cm "
+                        f"is within safe stop threshold {self.target_stop_distance_cm:.1f} cm."
+                    )
+                    self._transition_to(RobotState.TARGET_REACHED, self._context.terminal_message)
+                    return self._state
 
             # Execute one short, bounded forward pulse only after fresh perception
             # and valid clear/warning-band proximity checks.

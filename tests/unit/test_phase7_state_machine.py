@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 import threading
+from dataclasses import replace
 from typing import Optional
 from unittest.mock import MagicMock
 import numpy as np
@@ -584,3 +585,37 @@ def test_forward_pulse_preemption_on_estop(fsm: RobotStateMachine):
     assert not worker.is_alive()
     assert fsm.motors.current_speeds == (0.0, 0.0)
     assert fsm.is_emergency_stop_latched is True
+
+
+def test_manual_backward_allowed_when_forward_obstacle_present(fsm: RobotStateMachine):
+    """Backward movement must succeed even if forward ultrasonic sensor detects an obstacle."""
+    fsm.distance_sensor.set_distance(15.0)  # Close obstacle directly ahead
+    fsm.config = replace(fsm.config, motion=replace(fsm.config.motion, manual_pulse_sec=0.05))
+
+    cmd = RobotCommand(
+        raw_transcript="backward", normalized_text="backward",
+        intent=CommandIntent.MOVEMENT, action=CommandAction.MOVE_BACKWARD,
+        speed=0.5, timestamp=time.time(),
+    )
+    accepted = fsm.handle_command(cmd)
+    assert accepted is True
+    # Invariant: Pulse finishes, motors are zeroed, FSM returns to IDLE_LISTENING
+    assert fsm.state == RobotState.IDLE_LISTENING
+    assert fsm.motors.current_speeds == (0.0, 0.0)
+
+
+def test_manual_forward_pulse_completes_and_stops_motors(fsm: RobotStateMachine):
+    """Forward motion pulse completes bounded duration and automatically zeros motors."""
+    fsm.distance_sensor.set_distance(100.0)  # Clear path ahead
+    fsm.config = replace(fsm.config, motion=replace(fsm.config.motion, manual_pulse_sec=0.05))
+
+    cmd = RobotCommand(
+        raw_transcript="forward", normalized_text="forward",
+        intent=CommandIntent.MOVEMENT, action=CommandAction.MOVE_FORWARD,
+        speed=0.5, timestamp=time.time(),
+    )
+    accepted = fsm.handle_command(cmd)
+    assert accepted is True
+    assert fsm.state == RobotState.IDLE_LISTENING
+    assert fsm.motors.current_speeds == (0.0, 0.0)
+

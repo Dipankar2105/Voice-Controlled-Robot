@@ -133,7 +133,10 @@ class RobotRuntime:
         self._last_raw_transcript: str = ""
         self._current_partial_transcript: str = ""
         self._last_parsed_command: Optional[RobotCommand] = None
-        self.ultrasonic_protection_enabled: bool = False
+        self.ultrasonic_protection_enabled: bool = True
+        self._joystick_active: bool = False
+        self._last_joystick_time: float = 0.0
+        self._joystick_watchdog_sec: float = 0.40
 
     def set_ultrasonic_protection(self, enabled: bool) -> None:
         """Enable or disable ultrasonic obstacle protection."""
@@ -440,8 +443,23 @@ class RobotRuntime:
                     reading = self.distance_sensor.get_reading()
                     self._cached_distance_reading = reading
                 except Exception as exc:
-                    logger.error("Distance worker sample error; invalidating cached reading: %s", exc)
+                    logger.debug("Distance worker sample error; invalidating cached reading: %s", exc)
                     self._cached_distance_reading = UltrasonicReading.create_fault()
+
+            # Joystick watchdog: ensure motors halt if joystick heartbeat lease expires
+            if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
+                with self._command_lock:
+                    if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
+                        self._joystick_active = False
+                        if self.motors:
+                            try:
+                                self.motors.stop()
+                            except Exception:
+                                pass
+                        if self.fsm and self.fsm.state == RobotState.MANUAL_MOVEMENT:
+                            self.fsm._transition_to(RobotState.IDLE_LISTENING, "Joystick watchdog lease expired; motors stopped.")
+                        logger.info("Joystick watchdog lease expired; motors safely stopped.")
+
             time.sleep(0.08)  # ~12.5 Hz refresh
 
     def _mission_worker(self) -> None:
@@ -494,10 +512,26 @@ class RobotRuntime:
                 time.sleep(0.05)
 
     def _vision_worker(self) -> None:
-        """Background optical perception thread running periodic YOLO inference (~1-2 Hz)."""
+        """Background optical perception thread running periodic YOLO inference (~1 Hz during idle)."""
+        detect_freq = getattr(self.config.vision, "detect_frequency_hz", 1.0)
+        target_sleep = max(0.5, 1.0 / max(0.2, float(detect_freq)))
+
         while not self._stop_event.is_set():
+            # If an autonomous mission is active, step_mission handles optical detection;
+            # pause background inference to eliminate duplicate model executions and reduce CPU load.
+            mission_active = (
+                self.fsm
+                and self.fsm.state in (
+                    RobotState.SEARCHING,
+                    RobotState.TARGET_CONFIRMED,
+                    RobotState.CENTERING,
+                    RobotState.APPROACHING,
+                )
+            )
+
             if (
-                self.camera
+                not mission_active
+                and self.camera
                 and self.detector
                 and self._state == LifecycleState.RUNNING
                 and self._subsystem_statuses.get("camera") == SubsystemStatus.READY
@@ -516,7 +550,8 @@ class RobotRuntime:
                         self._latest_detections_time = time.time()
                 except Exception as exc:
                     logger.debug("Vision worker error: %s", exc)
-            time.sleep(0.35)
+
+            time.sleep(target_sleep)
 
     def dispatch_text_command(self, raw_text: str) -> Tuple[bool, Optional[RobotCommand], str]:
         """Parse and execute a text command through the authoritative state machine.
@@ -560,6 +595,112 @@ class RobotRuntime:
                 return success, cmd, status_msg
             finally:
                 self._is_executing_command = False
+
+    def dispatch_joystick(
+        self, action: str, speed: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """Dispatch a responsive manual joystick action (forward, backward, left, right, stop).
+
+        Guarantees:
+        - Movement occurs only while actively held (supervised by heartbeat watchdog).
+        - Clamps speed to motion.manual_speed / max_speed.
+        - Immediate stop on action='stop' or watchdog timeout.
+        - Gated by forward ultrasonic obstacle check if protection is enabled.
+        - Refuses actuation if E-stop latched.
+        - Preempts/cancels any active autonomous search mission.
+        - Serializes actuation through _command_lock.
+        """
+        act = action.lower().strip()
+        if act not in ("forward", "backward", "left", "right", "stop"):
+            return False, f"Invalid joystick action: '{action}'"
+
+        if act == "stop":
+            with self._command_lock:
+                self._joystick_active = False
+                if self.motors:
+                    try:
+                        self.motors.stop()
+                    except Exception as exc:
+                        logger.error("Error stopping motors from joystick: %s", exc)
+                if self.fsm and self.fsm.state == RobotState.MANUAL_MOVEMENT:
+                    self.fsm._transition_to(RobotState.IDLE_LISTENING, "Joystick released / stop commanded.")
+                return True, "Motors stopped"
+
+        if self.fsm and self.fsm.is_emergency_stop_latched:
+            return False, "Emergency stop is latched: actuation refused"
+
+        # Interrupt any ongoing autonomous mission
+        if self.fsm and self.fsm.state in (
+            RobotState.SEARCHING,
+            RobotState.TARGET_CONFIRMED,
+            RobotState.CENTERING,
+            RobotState.APPROACHING,
+        ):
+            self.fsm.cancel_mission("Interrupted by manual joystick teleoperation")
+
+        # Clamp speed
+        max_spd = float(getattr(self.config.motion, "max_speed", 1.0))
+        base_spd = float(getattr(self.config.motion, "manual_speed", 0.75))
+        turn_spd = float(getattr(self.config.motion, "turn_speed", 0.40))
+
+        if speed is not None:
+            cmd_spd = max(0.10, min(max_spd, float(speed)))
+        else:
+            cmd_spd = base_spd
+
+        # Ultrasonic forward obstacle safety check
+        if act == "forward" and self.fsm:
+            if not self.fsm._is_forward_path_safe():
+                with self._command_lock:
+                    self._joystick_active = False
+                    if self.motors:
+                        self.motors.stop()
+                    self.fsm._transition_to(RobotState.BLOCKED, "Forward motion blocked by ultrasonic obstacle.")
+                return False, "Forward motion blocked by ultrasonic obstacle"
+
+        with self._command_lock:
+            if not self.motors:
+                self._joystick_active = True
+                self._last_joystick_time = time.time()
+                if self.fsm and self.fsm.state in (
+                    RobotState.IDLE_LISTENING,
+                    RobotState.CANCELLED,
+                    RobotState.TARGET_REACHED,
+                    RobotState.TARGET_NOT_FOUND,
+                ):
+                    self.fsm._transition_to(RobotState.MANUAL_MOVEMENT, f"Mock joystick: {act}")
+                return True, f"Mock joystick {act} accepted"
+
+            try:
+                if not self.motors.is_enabled:
+                    self.motors.enable(True)
+
+                if act == "forward":
+                    self.motors.set_speeds(cmd_spd, cmd_spd)
+                elif act == "backward":
+                    self.motors.set_speeds(-cmd_spd, -cmd_spd)
+                elif act == "left":
+                    self.motors.set_speeds(-turn_spd, turn_spd)
+                elif act == "right":
+                    self.motors.set_speeds(turn_spd, -turn_spd)
+
+                self._joystick_active = True
+                self._last_joystick_time = time.time()
+
+                if self.fsm and self.fsm.state in (
+                    RobotState.IDLE_LISTENING,
+                    RobotState.CANCELLED,
+                    RobotState.TARGET_REACHED,
+                    RobotState.TARGET_NOT_FOUND,
+                ):
+                    self.fsm._transition_to(RobotState.MANUAL_MOVEMENT, f"Joystick motion: {act}")
+
+                return True, f"Joystick {act} executing at speed {cmd_spd:.2f}"
+            except Exception as exc:
+                logger.error("Exception executing joystick command '%s': %s", act, exc)
+                self.motors.stop()
+                self._joystick_active = False
+                return False, f"Motor command error: {exc}"
 
     def stop(self) -> None:
         """Immediately zero motor speeds, cancel active missions, and pause sampling workers."""
@@ -830,13 +971,40 @@ class RobotRuntime:
             and obs_state not in (ObstacleState.CRITICAL.value, ObstacleState.FAULT.value, ObstacleState.OUT_OF_RANGE.value)
         )
 
+        # Determine high-level operating control mode
+        if estop_latched:
+            control_mode = "EMERGENCY_STOP"
+        elif fsm_state_str == "BLOCKED":
+            control_mode = "BLOCKED"
+        elif getattr(self, "_joystick_active", False):
+            control_mode = "MANUAL_JOYSTICK"
+        elif fsm_state_str == "MANUAL_MOVEMENT":
+            control_mode = "VOICE_MANUAL"
+        elif fsm_state_str in ("SEARCHING", "TARGET_CONFIRMED"):
+            control_mode = "TARGET_SEARCH"
+        elif fsm_state_str == "CENTERING":
+            control_mode = "TARGET_CENTERING"
+        elif fsm_state_str == "APPROACHING":
+            control_mode = "APPROACH"
+        elif fsm_state_str == "TARGET_REACHED":
+            control_mode = "STANDOFF_STOP"
+        elif fsm_state_str == "TARGET_NOT_FOUND":
+            control_mode = "TARGET_LOST"
+        else:
+            control_mode = "IDLE_LISTENING"
+
         return {
             "health": {
                 "is_healthy": is_healthy,
                 "mode": self.config.mode.value,
+                "control_mode": control_mode,
                 "lifecycle_state": self._state.value,
                 "uptime_sec": _sanitize_float(uptime),
                 "active_fault": active_fault,
+            },
+            "control_mode": control_mode,
+            "joystick": {
+                "active": getattr(self, "_joystick_active", False),
             },
             "speech": {
                 "listening_state": listening_state,

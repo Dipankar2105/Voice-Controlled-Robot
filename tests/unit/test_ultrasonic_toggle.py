@@ -143,14 +143,14 @@ def test_ultrasonic_state_labels():
     assert sensor.get_sensor_state_label() == "STALE"
 
 
-def test_protection_defaults_to_off_for_demo():
-    """Ultrasonic obstacle protection must default to False for demonstration launch."""
+def test_protection_defaults_to_on_at_startup():
+    """Ultrasonic obstacle protection must default to True at startup."""
     runtime = RobotRuntime()
-    assert runtime.ultrasonic_protection_enabled is False
+    assert runtime.ultrasonic_protection_enabled is True
 
     runtime.initialize()
     assert runtime.fsm is not None
-    assert runtime.fsm.ultrasonic_protection_enabled is False
+    assert runtime.fsm.ultrasonic_protection_enabled is True
 
 
 def test_forward_motion_blocked_when_protection_on_with_obstacle():
@@ -243,38 +243,43 @@ def test_api_ultrasonic_protection_toggle_and_telemetry():
     app = create_app(runtime)
     client = TestClient(app)
 
-    # 1. Initial status shows protection OFF by default for demo
+    # 1. Initial status shows protection ON by default
     res = client.get("/api/status")
     assert res.status_code == 200
-    telemetry = res.json()
-    assert telemetry["ultrasonic"]["protection_enabled"] is False
-    assert "ULTRASONIC_PROTECTION_DISABLED" in telemetry["messages"]
-
-    # 2. Toggle protection ON via API
-    res = client.post("/api/ultrasonic/protection", json={"enabled": True})
-    assert res.status_code == 200
-    assert res.json()["success"] is True
-    assert res.json()["enabled"] is True
-    assert runtime.ultrasonic_protection_enabled is True
-    assert runtime.fsm.ultrasonic_protection_enabled is True
-
-    # 3. Status now reflects ON and removes warning notice
-    res = client.get("/api/status")
     telemetry = res.json()
     assert telemetry["ultrasonic"]["protection_enabled"] is True
     assert "ULTRASONIC_PROTECTION_DISABLED" not in telemetry["messages"]
+
+    # 2. Toggle protection OFF via API
+    res = client.post("/api/ultrasonic/protection", json={"enabled": False})
+    assert res.status_code == 200
+    assert res.json()["success"] is True
+    assert res.json()["enabled"] is False
+    assert runtime.ultrasonic_protection_enabled is False
+    assert runtime.fsm.ultrasonic_protection_enabled is False
+
+    # 3. Status now reflects OFF and adds warning notice
+    res = client.get("/api/status")
+    telemetry = res.json()
+    assert telemetry["ultrasonic"]["protection_enabled"] is False
+    assert "ULTRASONIC_PROTECTION_DISABLED" in telemetry["messages"]
 
     # 4. Input validation: invalid payload rejected with 422
     res = client.post("/api/ultrasonic/protection", json={"invalid_field": 123})
     assert res.status_code == 422
 
-    # 5. Toggle protection back OFF
-    res = client.post("/api/ultrasonic/protection", json={"enabled": False})
+    # 5. Toggle protection back ON
+    res = client.post("/api/ultrasonic/protection", json={"enabled": True})
     assert res.status_code == 200
-    assert res.json()["enabled"] is False
-    assert runtime.ultrasonic_protection_enabled is False
-    assert runtime.fsm.ultrasonic_protection_enabled is False
+    assert res.json()["enabled"] is True
+    assert runtime.ultrasonic_protection_enabled is True
     assert runtime.fsm.ultrasonic_protection_enabled is True
+
+    # 6. Status now reflects ON and removes warning notice
+    res = client.get("/api/status")
+    telemetry = res.json()
+    assert telemetry["ultrasonic"]["protection_enabled"] is True
+    assert "ULTRASONIC_PROTECTION_DISABLED" not in telemetry["messages"]
 
 
 def test_real_hardware_mode_requires_token_to_toggle_protection():

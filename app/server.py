@@ -14,6 +14,7 @@ Guarantees:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import threading
 import secrets
 import time
@@ -261,12 +262,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     input:checked + .slider:before {
       transform: translateX(20px);
     }
+    .btn-joy {
+      background: #1e293b;
+      color: #fff;
+      font-size: 1.1rem;
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.1s, transform 0.05s;
+      user-select: none;
+      touch-action: none;
+    }
+    .btn-joy:active {
+      background: #0284c7;
+      transform: scale(0.95);
+    }
+    .btn-joy-stop {
+      background: #dc2626;
+      color: #fff;
+      font-size: 1.1rem;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+    }
+    .btn-joy-stop:active {
+      background: #991b1b;
+    }
   </style>
 </head>
 <body>
 
   <!-- Persistent Warning Banner for Ultrasonic Protection OFF -->
-  <div id="ultrasonic-warning-banner" style="display:block; background:#7f1d1d; border:2px solid #ef4444; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#fff; font-weight:700; text-align:center;">
+  <div id="ultrasonic-warning-banner" style="display:none; background:#7f1d1d; border:2px solid #ef4444; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#fff; font-weight:700; text-align:center;">
     ⚠️ CAUTION: ULTRASONIC OBSTACLE PROTECTION IS DISABLED! Robot will not stop for obstacles. Exercise extreme vigilance.
   </div>
 
@@ -274,6 +308,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="header-title">SS_PROJECT_VCR // AUTONOMOUS RUNTIME</div>
     <div class="header-badges">
       <span id="badge-mode" class="badge badge-sim">SIMULATION</span>
+      <span id="badge-control-mode" class="badge badge-state">IDLE_LISTENING</span>
       <span id="badge-health" class="badge badge-healthy">HEALTHY</span>
       <span id="badge-state" class="badge badge-state">IDLE_LISTENING</span>
       <span class="badge" id="badge-uptime" style="background:#1e293b; color:var(--text-muted)">UP: 00:00:00</span>
@@ -350,10 +385,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <div style="display:flex; align-items:center; gap:8px;">
           <label class="switch">
-            <input type="checkbox" id="toggle-ultrasonic-protection" onchange="onToggleProtection(this.checked)">
+            <input type="checkbox" id="toggle-ultrasonic-protection" checked onchange="onToggleProtection(this.checked)">
             <span class="slider"></span>
           </label>
-          <span id="label-protection-status" style="font-size:0.85rem; font-weight:700; color:var(--rose); width:32px;">OFF</span>
+          <span id="label-protection-status" style="font-size:0.85rem; font-weight:700; color:var(--emerald); width:32px;">ON</span>
         </div>
       </div>
     </div>
@@ -428,6 +463,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="data-row">
         <span class="data-label">Right Channel Speed:</span>
         <span class="data-val" id="val-motor-right">0.00</span>
+      </div>
+    </div>
+
+    <!-- Responsive Manual Joystick Control -->
+    <div class="card" id="card-joystick">
+      <div class="card-title">
+        <span>MANUAL JOYSTICK CONTROLLER</span>
+        <span id="badge-joy-status" class="badge badge-state">RELEASED</span>
+      </div>
+      <div style="font-size:0.75rem; color:var(--text-muted);">
+        Hold joystick or pad to drive; release stops immediately. Watchdog: 400ms.
+      </div>
+
+      <div style="display:flex; gap:20px; align-items:center; justify-content:center; flex-wrap:wrap; margin:10px 0;">
+        <!-- Virtual Analog Joystick Touch Area -->
+        <div id="joystick-zone" style="position:relative; width:150px; height:150px; background:#0b0f19; border:2px solid var(--card-border); border-radius:50%; touch-action:none; user-select:none; cursor:grab; display:flex; align-items:center; justify-content:center;">
+          <div style="position:absolute; width:100%; height:100%; pointer-events:none;">
+            <div style="position:absolute; top:50%; left:12%; right:12%; height:1px; background:#23314e;"></div>
+            <div style="position:absolute; left:50%; top:12%; bottom:12%; width:1px; background:#23314e;"></div>
+          </div>
+          <div id="joystick-knob" style="position:absolute; width:52px; height:52px; border-radius:50%; background:radial-gradient(circle at 35% 35%, #38bdf8, #0284c7); border:2px solid #7dd3fc; box-shadow:0 0 10px rgba(56,189,248,0.5); pointer-events:none; transform:translate(0px, 0px);"></div>
+        </div>
+
+        <!-- Directional D-Pad Quick Hold Controls -->
+        <div style="display:grid; grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); gap:6px; user-select:none;">
+          <div></div>
+          <button class="btn-joy" id="joy-btn-up" onpointerdown="startJoyHold('forward')" onpointerup="stopJoyHold()" onpointerleave="stopJoyHold()" title="Hold for Forward">▲</button>
+          <div></div>
+          <button class="btn-joy" id="joy-btn-left" onpointerdown="startJoyHold('left')" onpointerup="stopJoyHold()" onpointerleave="stopJoyHold()" title="Hold for Turn Left">◄</button>
+          <button class="btn-joy-stop" onclick="sendStop()" title="Active Stop">⏹</button>
+          <button class="btn-joy" id="joy-btn-right" onpointerdown="startJoyHold('right')" onpointerup="stopJoyHold()" onpointerleave="stopJoyHold()" title="Hold for Turn Right">►</button>
+          <div></div>
+          <button class="btn-joy" id="joy-btn-down" onpointerdown="startJoyHold('backward')" onpointerup="stopJoyHold()" onpointerleave="stopJoyHold()" title="Hold for Backward">▼</button>
+          <div></div>
+        </div>
+      </div>
+
+      <!-- Speed Slider and Joystick Status -->
+      <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.8rem;">
+        <span class="data-label">Speed Limit: <span id="val-joy-spd-label" style="color:#fff; font-weight:700;">60%</span></span>
+        <input type="range" id="joy-speed-slider" min="20" max="100" value="60" step="5" style="width:130px;" oninput="onJoySpeedChange(this.value)">
+      </div>
+      <div class="data-row">
+        <span class="data-label">Joystick State:</span>
+        <span class="data-val" id="val-joy-state" style="color:var(--text-muted);">RELEASED (STOPPED)</span>
       </div>
     </div>
 
@@ -845,6 +925,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           motBadge.className = 'badge ' + (data.motor.command_state === 'STOPPED' ? 'badge-state' : 'badge-real');
         }
 
+        // Control Mode Badge
+        const ctrlMode = data.control_mode || fsmState;
+        const ctrlBadge = document.getElementById('badge-control-mode');
+        if (ctrlBadge) {
+          ctrlBadge.textContent = ctrlMode;
+          if (ctrlMode === 'EMERGENCY_STOP' || ctrlMode === 'BLOCKED') {
+            ctrlBadge.className = 'badge badge-fault';
+          } else if (ctrlMode === 'MANUAL_JOYSTICK' || ctrlMode === 'VOICE_MANUAL') {
+            ctrlBadge.className = 'badge badge-real';
+          } else {
+            ctrlBadge.className = 'badge badge-state';
+          }
+        }
+
+        // Joystick Badge in card
+        const joyBadge = document.getElementById('badge-joy-status');
+        if (joyBadge) {
+          const joyAct = data.joystick && data.joystick.active;
+          joyBadge.textContent = joyAct ? 'DRIVING' : 'RELEASED';
+          joyBadge.className = 'badge ' + (joyAct ? 'badge-real' : 'badge-state');
+        }
+
       } catch (err) {
         const hBadge = document.getElementById('badge-health');
         if (hBadge) {
@@ -951,6 +1053,147 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    // Joystick State & Handlers
+    let joystickDragging = false;
+    let joystickInterval = null;
+    let currentJoyAction = null;
+    let joySpeed = 0.60;
+
+    function onJoySpeedChange(val) {
+      joySpeed = parseInt(val, 10) / 100.0;
+      const lbl = document.getElementById('val-joy-spd-label');
+      if (lbl) lbl.textContent = `${val}%`;
+    }
+
+    async function sendJoystickCommand(action, speed) {
+      try {
+        const res = await fetch('/api/joystick', {
+          method: 'POST',
+          headers: controlHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ action: action, speed: speed })
+        });
+        if (res.status === 401) {
+          showAuthOverlay();
+          stopJoyHold();
+          return;
+        }
+        const data = await res.json();
+        const stateEl = document.getElementById('val-joy-state');
+        if (stateEl) {
+          if (action === 'stop') {
+            stateEl.textContent = 'RELEASED (STOPPED)';
+            stateEl.style.color = 'var(--text-muted)';
+          } else if (data.success) {
+            stateEl.textContent = `HELD: ${action.toUpperCase()} (${(speed * 100).toFixed(0)}%)`;
+            stateEl.style.color = 'var(--cyan)';
+          } else {
+            stateEl.textContent = `BLOCKED: ${data.message}`;
+            stateEl.style.color = 'var(--rose)';
+          }
+        }
+      } catch (e) {
+        stopJoyHold();
+      }
+    }
+
+    function startJoyHold(action) {
+      if (currentJoyAction === action && joystickInterval) return;
+      stopJoyHold();
+      currentJoyAction = action;
+      sendJoystickCommand(action, joySpeed);
+      joystickInterval = setInterval(() => {
+        if (currentJoyAction) {
+          sendJoystickCommand(currentJoyAction, joySpeed);
+        }
+      }, 100);
+    }
+
+    function stopJoyHold() {
+      if (joystickInterval) {
+        clearInterval(joystickInterval);
+        joystickInterval = null;
+      }
+      if (currentJoyAction) {
+        currentJoyAction = null;
+        sendJoystickCommand('stop', 0.0);
+      }
+    }
+
+    // Touch & Mouse Canvas Analog Joystick
+    const joyZone = document.getElementById('joystick-zone');
+    const joyKnob = document.getElementById('joystick-knob');
+    if (joyZone && joyKnob) {
+      const maxR = 45;
+
+      function handleJoyPointer(e) {
+        if (!joystickDragging) return;
+        const rect = joyZone.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const clientX = e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : centerX);
+        const clientY = e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : centerY);
+
+        let dx = clientX - centerX;
+        let dy = clientY - centerY;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist > maxR) {
+          dx = (dx / dist) * maxR;
+          dy = (dy / dist) * maxR;
+        }
+
+        joyKnob.style.transform = `translate(${dx}px, ${dy}px)`;
+
+        // Deadzone threshold = 14px
+        if (dist < 14) {
+          if (currentJoyAction) {
+            stopJoyHold();
+          }
+          return;
+        }
+
+        // Determine dominant direction
+        let act = null;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          act = dy < 0 ? 'forward' : 'backward';
+        } else {
+          act = dx < 0 ? 'left' : 'right';
+        }
+
+        if (act && act !== currentJoyAction) {
+          startJoyHold(act);
+        }
+      }
+
+      joyZone.addEventListener('pointerdown', (e) => {
+        joystickDragging = true;
+        joyZone.setPointerCapture(e.pointerId);
+        joyZone.style.cursor = 'grabbing';
+        handleJoyPointer(e);
+      });
+
+      joyZone.addEventListener('pointermove', handleJoyPointer);
+
+      const endPointer = (e) => {
+        if (!joystickDragging) return;
+        joystickDragging = false;
+        try { joyZone.releasePointerCapture(e.pointerId); } catch (_) {}
+        joyZone.style.cursor = 'grab';
+        joyKnob.style.transform = 'translate(0px, 0px)';
+        stopJoyHold();
+      };
+
+      joyZone.addEventListener('pointerup', endPointer);
+      joyZone.addEventListener('pointercancel', endPointer);
+    }
+
+    // Safety stops on window blur, disconnect, page unload, visibility change
+    window.addEventListener('blur', stopJoyHold);
+    window.addEventListener('beforeunload', stopJoyHold);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) stopJoyHold();
+    });
+
     // Auto-refresh telemetry every 250ms
     setInterval(updateTelemetry, 250);
     updateTelemetry();
@@ -968,6 +1211,11 @@ class UltrasonicProtectionRequest(BaseModel):
     enabled: bool
 
 
+class JoystickRequest(BaseModel):
+    action: str
+    speed: Optional[float] = None
+
+
 def create_app(runtime: RobotRuntime, control_token: Optional[str] = None) -> FastAPI:
     """FastAPI application factory attached to a single authoritative RobotRuntime.
 
@@ -977,17 +1225,17 @@ def create_app(runtime: RobotRuntime, control_token: Optional[str] = None) -> Fa
     if runtime.config.mode.value == "REAL_HARDWARE" and (not control_token or len(control_token) < 24):
         raise ValueError("REAL_HARDWARE dashboard requires a ROBOT_API_TOKEN of at least 24 characters; refusing unauthenticated motor-control API.")
 
+    @asynccontextmanager
+    async def lifespan(app_instance: FastAPI):
+        yield
+        runtime.cleanup()
+
     app = FastAPI(
         title="SS_PROJECT_VCR Runtime Dashboard",
         version="2.0.0",
         description="Unified local control and status dashboard for Voice Controlled Robot.",
+        lifespan=lifespan,
     )
-
-
-    @app.on_event("shutdown")
-    def on_shutdown() -> None:
-        """Trigger graceful runtime cleanup when uvicorn initiates shutdown."""
-        runtime.cleanup()
 
     @app.get("/", response_class=HTMLResponse)
     def get_dashboard() -> str:
@@ -1039,6 +1287,28 @@ def create_app(runtime: RobotRuntime, control_token: Optional[str] = None) -> Fa
                 "is_executable": cmd.is_executable if cmd else False,
                 "error_reason": cmd.error_reason if cmd else None,
             } if cmd else None,
+        }
+
+    @app.post("/api/joystick")
+    def post_joystick(
+        req: JoystickRequest,
+        _: None = Depends(require_control_token),
+    ) -> Dict[str, Any]:
+        """Responsive joystick actuation route with lease timeout.
+
+        Guarantees:
+        - Movement only while actively held (watchdog lease stops motors on expiry).
+        - Clamps speed to validated limits.
+        - Stop on release, disconnect, timeout, page unload, and E-stop.
+        - Fails closed if obstacle inside blocked zone when protection is enabled.
+        - Serializes with ongoing operations and halts autonomous missions cleanly.
+        """
+        success, message = runtime.dispatch_joystick(req.action, req.speed)
+        return {
+            "success": success,
+            "message": message,
+            "action": req.action,
+            "joystick_active": getattr(runtime, "_joystick_active", False),
         }
 
     @app.post("/api/stop")
