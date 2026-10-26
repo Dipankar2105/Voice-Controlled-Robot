@@ -1,0 +1,199 @@
+"""Phase 2 verification tests: Configuration engine, dynamic path resolution, and runtime foundation."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import pytest
+
+from app.config import (
+    AppConfig,
+    ConfigurationError,
+    MotorDriverConfig,
+    SafetyConfig,
+    UltrasonicConfig,
+    VisionConfig,
+    get_project_root,
+    load_config,
+    load_config_from_dict,
+)
+from app.constants import ExecutionMode, FaultCode
+from app.hardware.interfaces import ObstacleState
+from app.hardware.mock_hardware import (
+    MockAudioSource,
+    MockCamera,
+    MockDistanceSensor,
+    MockMotorController,
+)
+from app.runtime import LifecycleState, RobotRuntime
+from app.status import SubsystemStatus
+
+
+def test_valid_configuration_and_dynamic_path_resolution(tmp_path):
+    """Configuration must resolve project root independently of the current shell working directory."""
+    original_cwd = os.getcwd()
+    try:
+        # Change working directory to an arbitrary temporary directory
+        os.chdir(tmp_path)
+        assert os.getcwd() == str(tmp_path)
+
+        # load_config must still resolve project root and default config
+        cfg = load_config()
+        assert cfg.robot_name == "VoiceRobot4WD"
+        assert cfg.mode == ExecutionMode.SIMULATION
+        assert cfg.motor.left_ena_pin == 18
+
+        root = get_project_root()
+        assert (root / "config" / "default_config.yaml").is_file()
+        assert (root / "models" / "object_detection" / "best_v2_target.onnx").is_file()
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_duplicate_pin_assignments_detected():
+    """Duplicate GPIO pins across any subsystems must raise ConfigurationError."""
+    # Assign Left ENA (18) and Ultrasonic ECHO (24) to the same pin 18
+    motor_cfg = MotorDriverConfig(left_ena_pin=18)
+    ultrasonic_cfg = UltrasonicConfig(echo_pin=18)
+
+    cfg = AppConfig(motor=motor_cfg, ultrasonic=ultrasonic_cfg)
+    with pytest.raises(ConfigurationError, match="Duplicate GPIO pin assignment"):
+        cfg.validate()
+
+
+def test_invalid_ranges_and_threshold_monotonicity():
+    """Invalid speeds and non-monotonic safety thresholds must raise clear ConfigurationError."""
+    # Invalid speed (> 1.0)
+    cfg_speed = AppConfig()
+    d = {
+        "robot": {"mode": "SIMULATION"},
+        "motion": {"manual_speed": 1.5},
+    }
+    with pytest.raises(ConfigurationError, match="violates valid range"):
+        load_config_from_dict(d)
+
+    # Monotonicity violation: critical >= blocked
+    d_mono = {
+        "robot": {"mode": "SIMULATION"},
+        "safety": {
+            "obstacle_warning_cm": 50.0,
+            "obstacle_blocked_cm": 20.0,
+            "obstacle_critical_cm": 25.0,  # Critical > Blocked is illegal
+        },
+    }
+    with pytest.raises(ConfigurationError, match="monotonic ordering"):
+        load_config_from_dict(d_mono)
+
+
+def test_missing_model_files_detection():
+    """Missing model files must be detected and reported with descriptive errors."""
+    root = get_project_root()
+    cfg = AppConfig(
+        mode=ExecutionMode.SIMULATION,
+        vision=VisionConfig(model_path="models/object_detection/non_existent.onnx"),
+    )
+    missing = cfg.validate_asset_files(root)
+    assert any("non_existent.onnx" in m for m in missing)
+
+
+def test_real_hardware_mode_fails_closed_without_silent_fallback(monkeypatch):
+    """Requesting REAL_HARDWARE mode on a non-Pi development host must fail closed."""
+    import platform
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    cfg = AppConfig(mode=ExecutionMode.REAL_HARDWARE)
+    with pytest.raises(ConfigurationError, match="REAL_HARDWARE was explicitly requested"):
+        cfg.validate()
+
+
+def test_runtime_lifecycle_start_stop_idempotency():
+    """start(), stop(), and cleanup() must be fully idempotent and never crash on repeated calls."""
+    cfg = load_config()
+    runtime = RobotRuntime(config=cfg)
+
+    assert runtime.lifecycle_state == LifecycleState.CREATED
+
+    # Initial start
+    runtime.start()
+    assert runtime.lifecycle_state == LifecycleState.RUNNING
+
+    # Repeated start (idempotent no-op)
+    runtime.start()
+    assert runtime.lifecycle_state == LifecycleState.RUNNING
+
+    # Stop
+    runtime.stop()
+    assert runtime.lifecycle_state == LifecycleState.STOPPED
+
+    # Repeated stop (idempotent no-op)
+    runtime.stop()
+    assert runtime.lifecycle_state == LifecycleState.STOPPED
+
+    # Cleanup
+    runtime.cleanup()
+    assert runtime.lifecycle_state == LifecycleState.CLEANED_UP
+
+    # Repeated cleanup (idempotent no-op)
+    runtime.cleanup()
+    assert runtime.lifecycle_state == LifecycleState.CLEANED_UP
+
+
+def test_runtime_defaults_to_no_movement():
+    """Motors must strictly default to zero speed and disabled state during startup."""
+    mock_motors = MockMotorController(initially_enabled=False)
+    runtime = RobotRuntime(motor_controller=mock_motors)
+
+    runtime.initialize()
+    assert mock_motors.current_speeds == (0.0, 0.0)
+    assert not mock_motors.is_enabled
+
+    runtime.start()
+    assert mock_motors.current_speeds == (0.0, 0.0)
+
+    runtime.stop()
+    assert mock_motors.current_speeds == (0.0, 0.0)
+
+
+def test_runtime_dependency_injection_and_health_reporting():
+    """Subsystems can be injected and accurately reflected in SystemHealth telemetry."""
+    mock_motors = MockMotorController()
+    mock_sensor = MockDistanceSensor(initial_distance_cm=65.0)
+    mock_cam = MockCamera(width=640, height=480)
+    mock_audio = MockAudioSource()
+
+    runtime = RobotRuntime(
+        motor_controller=mock_motors,
+        distance_sensor=mock_sensor,
+        camera=mock_cam,
+        audio_source=mock_audio,
+    )
+    runtime.start()
+
+    health = runtime.get_health()
+    assert health.is_healthy
+    assert health.mode == ExecutionMode.SIMULATION
+    assert health.active_fault == FaultCode.OK
+    assert health.subsystems["motors"] == SubsystemStatus.READY
+    assert health.subsystems["sensor"] == SubsystemStatus.READY
+    assert health.subsystems["camera"] == SubsystemStatus.READY
+    assert health.last_distance_cm == 65.0
+    assert health.obstacle_state == ObstacleState.CLEAR
+
+    # Test serialization to dict
+    d = health.to_dict()
+    assert d["mode"] == "SIMULATION"
+    assert d["is_healthy"] is True
+    assert d["current_speeds"] == {"left": 0.0, "right": 0.0}
+
+    runtime.cleanup()
+
+
+def test_runtime_unhealthy_on_critical_obstacle():
+    """A critical obstacle (< 15 cm) automatically marks system health as degraded/unhealthy."""
+    mock_sensor = MockDistanceSensor(initial_distance_cm=10.0)
+    runtime = RobotRuntime(distance_sensor=mock_sensor)
+    runtime.start()
+
+    health = runtime.get_health()
+    assert health.obstacle_state == ObstacleState.CRITICAL
+    assert not health.is_healthy  # Unhealthy because obstacle is critical
+
+    runtime.cleanup()

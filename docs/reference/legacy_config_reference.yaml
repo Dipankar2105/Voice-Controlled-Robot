@@ -1,0 +1,59 @@
+# REFERENCE COPY ONLY — DO NOT USE AS ACTIVE CONFIGURATION
+# Extracted from SS_VCR_FINAL_CLEAN archive for reference during Phase 0/1 audit.
+
+legacy_config_yaml:
+  robot:
+    name: VoiceRobot4WD
+    version: 1.0.0
+    input_mode: webcam
+    hardware_mock: false
+  hardware:
+    mock_mode: false
+    loop_frequency_hz: 20
+  camera:
+    device_index: 0
+    width: 640
+    height: 480
+    fps: 15
+  voice:
+    sample_rate: 16000
+    channels: 1
+    chunk_size: 1024
+    record_seconds: 3.0
+  vision:
+    model_path: ../models/object_detection/best_v2_target.onnx
+    input_width: 320
+    input_height: 320
+    confidence_threshold: 0.25
+    nms_threshold: 0.45
+    detect_frequency_hz: 6
+    search_scan_speed: 0.3
+    search_scan_duration_sec: 12.0
+  navigation:
+    obstacle_warning_cm: 50.0
+    obstacle_blocked_cm: 25.0
+    obstacle_critical_cm: 15.0
+    target_reached_area: 35000
+    default_speed: 0.6  # Note: Conflicted with config.py DEFAULT_MANUAL_SPEED = 0.75
+    turn_speed: 0.5     # Note: Conflicted with config.py TURN_SPEED = 0.40
+    deadband_pixels: 40
+
+legacy_gpio_config_yaml:
+  gpio_mode: "BCM"
+  motor_driver:
+    driver_type: "L298N"
+    pwm_frequency: 100
+    left_motor:
+      ena_pin: 18
+      in1_pin: 17
+      in2_pin: 27
+    right_motor:
+      enb_pin: 13
+      in3_pin: 22
+      in4_pin: 5
+  ultrasonic_sensor:
+    sensor_type: "HC-SR04"
+    trig_pin: 23
+    echo_pin: 24
+    max_distance_cm: 400
+    timeout_sec: 0.06

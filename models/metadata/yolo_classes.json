@@ -1,0 +1,78 @@
+{
+  "_comment": "Authoritative class metadata extracted directly from ONNX model embedded properties during Phase 0 audit.",
+  "models": {
+    "best_v2_target.onnx": {
+      "class_count": 26,
+      "classes": [
+        "person",
+        "chair",
+        "table",
+        "door",
+        "RED_TARGET",
+        "BLUE_TARGET",
+        "laptop",
+        "monitor",
+        "keyboard",
+        "mouse",
+        "backpack",
+        "book",
+        "bottle",
+        "trash_can",
+        "whiteboard",
+        "projector",
+        "clock",
+        "fan",
+        "fire_extinguisher",
+        "bookshelf",
+        "cup",
+        "cell_phone",
+        "remote_control",
+        "potted_plant",
+        "window",
+        "scissors"
+      ],
+      "aliases": {
+        "human": "person",
+        "someone": "person",
+        "bag": "backpack",
+        "shears": "scissors",
+        "scissor": "scissors",
+        "red object": "RED_TARGET",
+        "red": "RED_TARGET",
+        "blue object": "BLUE_TARGET",
+        "blue": "BLUE_TARGET"
+      }
+    },
+    "best_v1.onnx": {
+      "class_count": 25,
+      "classes": [
+        "person",
+        "chair",
+        "table",
+        "door",
+        "RED_TARGET",
+        "BLUE_TARGET",
+        "laptop",
+        "monitor",
+        "keyboard",
+        "mouse",
+        "backpack",
+        "book",
+        "bottle",
+        "trash_can",
+        "whiteboard",
+        "projector",
+        "clock",
+        "fan",
+        "fire_extinguisher",
+        "bookshelf",
+        "cup",
+        "cell_phone",
+        "remote_control",
+        "potted_plant",
+        "window"
+      ],
+      "notes": "Does NOT include scissors (Class 25)."
+    }
+  }
+}

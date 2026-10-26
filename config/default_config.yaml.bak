@@ -1,0 +1,83 @@
+# SS_PROJECT_VCR_FRESH Unified System Configuration
+# Standard: Strict validation, single source of truth
+
+robot:
+  name: "VoiceRobot4WD"
+  version: "2.0.0"
+  mode: "SIMULATION"   # Explicit mode: "SIMULATION" or "REAL_HARDWARE" (Raspberry Pi only)
+
+
+hardware:
+  gpio_mode: "BCM"
+  
+  motor_driver:
+    driver_type: "L298N"
+    pwm_frequency_hz: 100
+    
+    left_motor:
+      ena_pin: 18        # PWM speed control left
+      in1_pin: 17        # Direction 1
+      in2_pin: 27        # Direction 2
+      
+    right_motor:
+      enb_pin: 13        # PWM speed control right
+      in3_pin: 22        # Direction 3
+      in4_pin: 5         # Direction 4
+      
+  ultrasonic_sensor:
+    sensor_type: "HC-SR04"
+    trig_pin: 23         # Pi Output trigger
+    echo_pin: 24         # Pi Input echo (via 5V -> 3.3V divider)
+    max_distance_cm: 400.0
+    min_distance_cm: 2.0
+    timeout_sec: 0.06
+
+motion:
+  manual_speed: 0.75
+  turn_speed: 0.40
+  approach_speed: 0.40
+  search_speed: 0.30
+  speed_ramp_step: 0.15
+  max_speed: 1.00
+  search_scan_duration_sec: 12.0
+  calibrated_360_duration_sec: null  # null indicates open-loop uncalibrated
+
+safety:
+  obstacle_warning_cm: 50.0
+  obstacle_blocked_cm: 25.0
+  obstacle_critical_cm: 15.0
+  target_stop_distance_cm: 30.0
+  watchdog_timeout_sec: 2.0
+  max_consecutive_target_loss: 3
+
+camera:
+  device_index: 0
+  width: 640
+  height: 480
+  fps: 15
+
+vision:
+  model_path: "models/object_detection/best_v2_target.onnx"
+  fallback_model_path: "models/object_detection/best_v1.onnx"
+  input_width: 320
+  input_height: 320
+  confidence_threshold: 0.25
+  nms_threshold: 0.45
+  deadband_pixels: 40
+  target_reached_area: 35000
+  detect_frequency_hz: 6
+
+audio:
+  model_dir: "models/voice/vosk-model"
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1024
+  record_seconds: 3.0
+  energy_threshold: 0.02
+  confidence_threshold: 0.60
+
+communication:
+  host: "0.0.0.0"
+  port: 8000
+  ws_port: 8001
+  enable_cors: false

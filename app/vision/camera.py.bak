@@ -1,0 +1,214 @@
+"""Camera Subsystem for SS_PROJECT_VCR_FRESH.
+
+Implements the Single Camera Owner pattern for Logitech C270 USB webcam.
+Features:
+- Drains V4L2 kernel frame buffer via a background capture thread to eliminate latency.
+- Serves a shared, synchronized latest frame interface for both YOLO detector and Web UI.
+- Validates frame dimensions (640x480) and frame freshness (< 0.5s).
+- Detects dropped frames and reports camera failure without claiming operational status.
+- Never opens hardware devices on import.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, Optional, Tuple, Union
+import numpy as np
+
+from app.config import CameraConfig
+from app.constants import CAMERA_DEVICE_INDEX, CAMERA_FPS, CAMERA_HEIGHT, CAMERA_WIDTH
+from app.hardware.interfaces import CameraInterface
+from app.logger import get_logger
+
+logger = get_logger("camera")
+
+
+class OpenCVCameraBackend:
+    """Real OpenCV VideoCapture device backend."""
+
+    def __init__(self, device_index: int = CAMERA_DEVICE_INDEX, width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT, fps: int = CAMERA_FPS):
+        self.device_index = device_index
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._cap: Any = None
+
+    def open(self) -> bool:
+        import cv2
+
+        logger.info("Opening physical camera device %d (%dx%d @ %d FPS)...", self.device_index, self.width, self.height, self.fps)
+        self._cap = cv2.VideoCapture(self.device_index)
+        if not self._cap.isOpened():
+            logger.error("Failed to open camera device index %d.", self.device_index)
+            return False
+
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self._cap.set(cv2.CAP_PROP_FPS, self.fps)
+        return True
+
+    def is_opened(self) -> bool:
+        return self._cap is not None and self._cap.isOpened()
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if not self.is_opened():
+            return False, None
+        return self._cap.read()
+
+    def release(self) -> None:
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception as exc:
+                logger.error("Error releasing cv2.VideoCapture: %s", exc)
+            self._cap = None
+
+
+class CameraOwner(CameraInterface):
+    """Authoritative single camera owner providing shared, fresh optical frames."""
+
+    def __init__(
+        self,
+        config: Optional[CameraConfig] = None,
+        backend: Optional[Any] = None,
+        max_staleness_sec: float = 0.50,
+        max_consecutive_drops: int = 5,
+    ):
+        self.config = config or CameraConfig()
+        self.backend = backend or OpenCVCameraBackend(
+            device_index=self.config.device_index,
+            width=self.config.width,
+            height=self.config.height,
+            fps=self.config.fps,
+        )
+        self.max_staleness_sec = float(max_staleness_sec)
+        self.max_consecutive_drops = int(max_consecutive_drops)
+
+        self._is_running = False
+        self._is_operational = False
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_timestamp: float = 0.0
+        self._consecutive_drops: int = 0
+        self._total_frames_captured: int = 0
+
+    @property
+    def is_operational(self) -> bool:
+        """Returns True only if the camera is opened, capturing frames, and within error limits."""
+        return self._is_operational and self._is_running
+
+    def is_opened(self) -> bool:
+        return self.backend.is_opened() if self.backend else False
+
+    def start(self) -> bool:
+        """Open camera backend and launch background frame-draining thread."""
+        with self._lock:
+            if self._is_running:
+                return True
+
+            logger.info("Starting CameraOwner background capture thread...")
+            if not self.backend.is_opened():
+                opened = self.backend.open()
+                if not opened:
+                    self._is_operational = False
+                    logger.error("CameraOwner start failed: backend could not be opened.")
+                    return False
+
+            self._is_running = True
+            self._consecutive_drops = 0
+            self._is_operational = False  # becomes true only after a valid frame arrives
+            self._thread = threading.Thread(target=self._capture_worker, daemon=True, name="CameraWorker")
+            self._thread.start()
+            logger.info("CameraOwner capture worker started; waiting for first valid frame.")
+            return True
+
+    def _capture_worker(self) -> None:
+        """Continuously grab frames to prevent V4L2 driver queue staleness."""
+        target_delay = 1.0 / max(1, self.config.fps)
+
+        while self._is_running:
+            loop_start = time.time()
+            try:
+                success, frame = self.backend.read()
+            except Exception as exc:
+                logger.error("Camera backend read raised an exception: %s", exc)
+                success, frame = False, None
+            now = time.time()
+
+            with self._lock:
+                if success and frame is not None:
+                    # Validate dimensions
+                    h, w = frame.shape[:2]
+                    if (w, h) == (self.config.width, self.config.height):
+                        self._latest_frame = frame
+                        self._latest_timestamp = now
+                        self._consecutive_drops = 0
+                        self._total_frames_captured += 1
+                        self._is_operational = True
+                    else:
+                        logger.warning("Frame dimension mismatch: got %dx%d, expected %dx%d", w, h, self.config.width, self.config.height)
+                        self._consecutive_drops += 1
+                        if self._consecutive_drops >= self.max_consecutive_drops:
+                            self._is_operational = False
+                            self._latest_frame = None
+                            logger.error(
+                                "Camera failure: %d consecutive frame dimension mismatches.",
+                                self._consecutive_drops,
+                            )
+                else:
+                    self._consecutive_drops += 1
+                    if self._consecutive_drops >= self.max_consecutive_drops:
+                        self._is_operational = False
+                        self._latest_frame = None
+                        logger.error(
+                            "Camera failure: %d consecutive frame capture failures.",
+                            self._consecutive_drops,
+                        )
+
+            elapsed = time.time() - loop_start
+            sleep_time = max(0.001, target_delay - elapsed)
+            time.sleep(sleep_time)
+
+    def capture_frame(self) -> Optional[np.ndarray]:
+        """Return the latest fresh optical frame as a uint8 BGR array [H, W, 3].
+        Returns None if frame is dropped, stale (> max_staleness_sec), or camera is degraded.
+        """
+        frame, _ = self.get_latest_frame_with_timestamp()
+        return frame
+
+    def get_latest_frame_with_timestamp(self) -> Tuple[Optional[np.ndarray], float]:
+        """Return latest frame and its acquisition timestamp."""
+        with self._lock:
+            if not self._is_running or not self._is_operational or self._latest_frame is None:
+                return None, 0.0
+
+            age = time.time() - self._latest_timestamp
+            if age > self.max_staleness_sec:
+                logger.warning("Captured frame is stale (age %.3fs > threshold %.3fs). Dropping.", age, self.max_staleness_sec)
+                return None, self._latest_timestamp
+
+            # Return a copy to ensure safe concurrent consumption by detector and web UI
+            return self._latest_frame.copy(), self._latest_timestamp
+
+    def stop(self) -> None:
+        """Stop background capture worker thread."""
+        with self._lock:
+            self._is_running = False
+            self._is_operational = False
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+        logger.info("CameraOwner worker stopped.")
+
+    def release(self) -> None:
+        """Permanently stop capture and release backend camera hardware."""
+        self.stop()
+        with self._lock:
+            if self.backend:
+                self.backend.release()
+            self._latest_frame = None
+            self._latest_timestamp = 0.0
+            logger.info("CameraOwner backend released.")
