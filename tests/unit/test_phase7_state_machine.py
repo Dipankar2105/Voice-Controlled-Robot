@@ -264,8 +264,8 @@ def test_blocked_distance_is_never_reported_as_target_reached(fsm: RobotStateMac
     assert fsm.motors.current_speeds == (0.0, 0.0)
 
 
-def test_offcenter_target_inside_stop_zone_does_not_trigger_blind_turn(fsm: RobotStateMachine):
-    """Close off-centre targets stop instead of turning without side-clearance sensing."""
+def test_offcenter_target_inside_stop_zone_performs_centering_turn(fsm: RobotStateMachine):
+    """Close off-centre targets perform bounded optical centering turns without ultrasonic refusal."""
     fsm.detector.has_class = MagicMock(return_value=True)
     offcenter = DetectionResult(
         class_id=12, class_name="bottle", confidence=0.9,
@@ -276,7 +276,7 @@ def test_offcenter_target_inside_stop_zone_does_not_trigger_blind_turn(fsm: Robo
     fsm._transition_to(RobotState.CENTERING, "Direct centering test")
     fsm.distance_sensor.set_distance(28.0)
     fsm.step_mission()
-    assert fsm.state == RobotState.BLOCKED
+    assert fsm.state == RobotState.CENTERING
     assert fsm.motors.current_speeds == (0.0, 0.0)
 
 

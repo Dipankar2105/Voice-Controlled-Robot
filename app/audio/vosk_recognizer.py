@@ -40,8 +40,13 @@ REVIEWED_COMMAND_VOCABULARY = [
     "straight",
     "backward",
     "move backward",
+    "backwards",
+    "move backwards",
+    "go backwards",
+    "backwad",
     "back",
     "go back",
+    "move back",
     "reverse",
     "turn left",
     "turn right",
@@ -126,7 +131,7 @@ def build_grammar_json(vocabulary: Optional[List[str]] = None) -> str:
         targets = [
             "person", "chair", "seat", "table", "door", "red target", "red object", "red",
             "blue target", "blue object", "blue", "laptop", "monitor", "screen", "display",
-            "keyboard", "mouse", "backpack", "bag", "pack", "schoolbag", "book", "bottle", "notebook", "mug",
+            "keyboard", "mouse", "backpack", "bag", "pack", "book", "bottle", "notebook", "mug",
             "water bottle", "trash can", "trash", "trashcan", "garbage can", "bin",
             "whiteboard", "board", "projector", "clock", "fan", "fire extinguisher",
             "extinguisher", "bookshelf", "cup", "cell phone", "phone", "mobile phone",
@@ -228,17 +233,38 @@ class VoskSpeechRecognizer(SpeechRecognizerInterface):
         if not pcm_data:
             return False
 
-        is_complete = self._recognizer.AcceptWaveform(pcm_data)
+        # Ensure even byte count for 16-bit PCM samples
+        if len(pcm_data) % 2 != 0:
+            pcm_data = pcm_data[: len(pcm_data) - 1]
+            if not pcm_data:
+                return False
+
+        try:
+            is_complete = self._recognizer.AcceptWaveform(pcm_data)
+        except Exception as exc:
+            logger.error("Vosk AcceptWaveform exception: %s", exc)
+            return False
 
         if is_complete:
-            res_json = json.loads(self._recognizer.Result())
-            self._latest_final = res_json.get("text", "").strip()
+            try:
+                res_json = json.loads(self._recognizer.Result())
+                self._latest_final = res_json.get("text", "").strip()
+            except Exception as exc:
+                logger.error("Failed to parse Vosk Result JSON: %s", exc)
+                self._latest_final = ""
             self._latest_partial = ""
         else:
-            part_json = json.loads(self._recognizer.PartialResult())
-            self._latest_partial = part_json.get("partial", "").strip()
+            try:
+                part_json = json.loads(self._recognizer.PartialResult())
+                self._latest_partial = part_json.get("partial", "").strip()
+            except Exception as exc:
+                logger.debug("Failed to parse Vosk PartialResult JSON: %s", exc)
+                self._latest_partial = ""
 
         return is_complete
+
+    # Compatibility alias for speech recognition interface
+    accept_audio = accept_waveform
 
     def get_result(self) -> str:
         """Retrieve and clear the latest finalized transcription."""
@@ -259,3 +285,11 @@ class VoskSpeechRecognizer(SpeechRecognizerInterface):
                 pass
         self._latest_partial = ""
         self._latest_final = ""
+
+    def close(self) -> None:
+        """Release Kaldi recognizer and model resources."""
+        self.reset()
+        self._recognizer = None
+        self._model = None
+        self._vosk = None
+        logger.info("Vosk speech recognition engine closed.")

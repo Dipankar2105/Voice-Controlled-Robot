@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -30,8 +31,13 @@ from app.constants import (
     CAMERA_WIDTH,
     DEADBAND_PIXELS,
     DEFAULT_APPROACH_PULSE_SEC,
+    DEFAULT_CENTERING_TURN_PULSE_SEC,
     DEFAULT_MANUAL_SPEED,
+    DEFAULT_MIN_CONFIRMATIONS,
+    DEFAULT_MISSION_TIMEOUT_SEC,
     DEFAULT_SEARCH_SCAN_SEC,
+    DEFAULT_SEARCH_TURN_PULSE_SEC,
+    DEFAULT_SENSOR_STALENESS_SEC,
     DEFAULT_SETTLING_DELAY_SEC,
     FaultCode,
     RobotState,
@@ -91,6 +97,7 @@ class RobotStateMachine:
         self._context: Optional[MissionContext] = None
         self._last_state_change_time = time.time()
         self._min_confirmations = 2
+        self._consecutive_camera_drops = 0
 
         # Parameters from config
         self.deadband_pixels = self.config.vision.deadband_pixels
@@ -100,6 +107,21 @@ class RobotStateMachine:
         self.search_scan_sec = self.config.motion.search_scan_duration_sec
         self.calibrated_360_duration_sec = self.config.motion.calibrated_360_duration_sec
         self.ultrasonic_protection_enabled: bool = True
+
+        # Motion & safety pulse parameters from config (no magic numbers)
+        self.search_turn_pulse_sec = getattr(self.config.motion, "search_turn_pulse_sec", DEFAULT_SEARCH_TURN_PULSE_SEC)
+        self.centering_turn_pulse_sec = getattr(self.config.motion, "centering_turn_pulse_sec", DEFAULT_CENTERING_TURN_PULSE_SEC)
+        self.approach_pulse_sec = getattr(self.config.motion, "approach_pulse_sec", DEFAULT_APPROACH_PULSE_SEC)
+        self.settling_delay_sec = getattr(self.config.motion, "settling_delay_sec", DEFAULT_SETTLING_DELAY_SEC)
+        self.mission_timeout_sec = getattr(self.config.safety, "mission_timeout_sec", DEFAULT_MISSION_TIMEOUT_SEC)
+        self.sensor_staleness_sec = getattr(self.config.safety, "sensor_staleness_sec", DEFAULT_SENSOR_STALENESS_SEC)
+        self._min_confirmations = getattr(self.config.vision, "min_confirmations", DEFAULT_MIN_CONFIRMATIONS)
+        self.turn_speed = getattr(self.config.motion, "turn_speed", TURN_SPEED)
+        self.approach_speed = getattr(self.config.motion, "approach_speed", APPROACH_SPEED)
+
+        # Bounded scan sector count
+        max_scan_sec = self.calibrated_360_duration_sec or self.search_scan_sec
+        self.max_scan_sectors = max(4, int(math.ceil(max_scan_sec / max(0.05, self.search_turn_pulse_sec))))
 
         # Transition to IDLE_LISTENING upon successful construction
         self._transition_to(RobotState.IDLE_LISTENING, "System initialized and ready.")
@@ -179,7 +201,7 @@ class RobotStateMachine:
                 return False
             if (reading is None or not reading.is_valid
                     or reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                    or reading.distance_cm <= self.config.safety.obstacle_blocked_cm):
+                    or (reading.distance_cm is not None and reading.distance_cm <= self.config.safety.obstacle_blocked_cm)):
                 logger.warning("E-stop clear refused until sensor is valid and the blocked zone is clear.")
                 return False
         else:
@@ -254,6 +276,22 @@ class RobotStateMachine:
                 RobotState.BLOCKED,
                 RobotState.FAULT,
             ):
+                if self._state == RobotState.FAULT:
+                    if self._active_fault == FaultCode.SENSOR_TIMEOUT and self.ultrasonic_protection_enabled:
+                        if self.distance_sensor:
+                            try:
+                                r = self.distance_sensor.get_reading()
+                                if r is None or not r.is_valid:
+                                    logger.warning("Resume listening rejected: distance sensor still failing.")
+                                    return False
+                            except Exception:
+                                logger.warning("Resume listening rejected: distance sensor read failed.")
+                                return False
+                    elif self._active_fault == FaultCode.CAMERA_FRAME_DROP:
+                        if self.camera and hasattr(self.camera, "is_operational") and not self.camera.is_operational:
+                            logger.warning("Resume listening rejected: camera hardware still degraded.")
+                            return False
+
                 self._active_fault = FaultCode.OK
                 self._transition_to(RobotState.IDLE_LISTENING, "Resumed listening.")
                 return True
@@ -321,7 +359,7 @@ class RobotStateMachine:
 
         raw_pulse = getattr(self.config.motion, "manual_pulse_sec", 1.25) if hasattr(self.config, "motion") else 1.25
         pulse_sec = max(0.05, min(2.00, float(raw_pulse)))
-        turn_spd = 0.75  # Full 75% PWM duty cycle for decisive floor turning torque
+        turn_spd = float(getattr(self.config.motion, "turn_speed", 0.40))
         is_turn = action in (CommandAction.TURN_LEFT, CommandAction.TURN_RIGHT)
         motion_duration = 2.50 if is_turn else pulse_sec
         try:
@@ -334,14 +372,29 @@ class RobotStateMachine:
             elif action == CommandAction.TURN_RIGHT:
                 self.motors.set_speeds(turn_spd, -turn_spd)
 
-            # Responsive sleep checking for emergency stop / active stop preemption
+            # Responsive sleep checking for emergency stop / active stop preemption / dynamic obstacle
             t_end = time.time() + motion_duration
+            last_obs_check = time.time()
             while time.time() < t_end:
                 if self._emergency_stop_latched or self._state != RobotState.MANUAL_MOVEMENT:
                     break
+                now_check = time.time()
+                if (
+                    action == CommandAction.MOVE_FORWARD
+                    and self.ultrasonic_protection_enabled
+                    and (now_check - last_obs_check >= 0.05)
+                ):
+                    last_obs_check = now_check
+                    if not self._is_forward_path_safe():
+                        self._transition_to(RobotState.BLOCKED, "Forward motion blocked by ultrasonic obstacle.")
+                        break
                 time.sleep(0.02)
         finally:
-            self.motors.stop()
+            if self.motors:
+                try:
+                    self.motors.stop()
+                except Exception as exc:
+                    logger.error("Error stopping motors after manual pulse: %s", exc)
         # STOP / EMERGENCY_STOP may preempt this blocking pulse from another
         # thread. Never overwrite that newer state when the pulse timer expires.
         if self._emergency_stop_latched or self._state != RobotState.MANUAL_MOVEMENT:
@@ -371,9 +424,19 @@ class RobotStateMachine:
             logger.warning("Ultrasonic reading invalid: state=%s", reading.state if reading else None)
             return False
 
+        ts = getattr(reading, "timestamp", 0.0)
+        if ts > 0:
+            age = time.time() - ts
+            if age > self.sensor_staleness_sec:
+                logger.warning("Forward motion refused: ultrasonic reading is stale (age=%.3fs > %.3fs)", age, self.sensor_staleness_sec)
+                self._active_fault = FaultCode.SENSOR_TIMEOUT
+                return False
+
         # Fail closed on BLOCKED/CRITICAL state or a numeric reading inside the blocked zone.
-        if (reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                or reading.distance_cm <= self.config.safety.obstacle_blocked_cm):
+        if (
+            reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
+            or (reading.distance_cm is not None and reading.distance_cm <= self.config.safety.obstacle_blocked_cm)
+        ):
             logger.warning("Forward motion refused: obstacle at %.1f cm (%s)", reading.distance_cm or 0.0, reading.state.value)
             return False
 
@@ -390,6 +453,12 @@ class RobotStateMachine:
             if not self.detector.has_class(target_class):
                 logger.error("Target class '%s' is not supported by current detector model.", target_class)
                 return False
+
+        if self.motors:
+            try:
+                self.motors.stop()
+            except Exception as exc:
+                logger.error("Error stopping motors on search mission start: %s", exc)
 
         self._context = MissionContext(
             target_class=target_class,
@@ -423,12 +492,22 @@ class RobotStateMachine:
             self._transition_to(RobotState.FAULT, "Missing target class in context.")
             return self._state
 
+        # Invariant: Mission timeout check
+        elapsed = time.time() - self._context.start_time
+        if elapsed >= self.mission_timeout_sec:
+            self._context.terminal_message = (
+                f"Mission timeout ({elapsed:.1f}s >= {self.mission_timeout_sec:.1f}s) "
+                f"exceeded without completing approach."
+            )
+            self._transition_to(RobotState.TARGET_NOT_FOUND, self._context.terminal_message)
+            return self._state
+
         # ===================================================================
         # STATE: SEARCHING (In-Place Check & Bounded Sector Turns)
         # ===================================================================
         if self._state == RobotState.SEARCHING:
             # Settle before capture to avoid motion blur
-            time.sleep(DEFAULT_SETTLING_DELAY_SEC)
+            time.sleep(self.settling_delay_sec)
 
             det = self._detect_target_in_frame(target_class)
             if det is not None:
@@ -443,38 +522,42 @@ class RobotStateMachine:
             # Target not seen in this sector: reset confirmation counter
             self._context.target_confirmed_count = 0
 
-            # Check scan completion
+            # Check scan completion (both duration and sector count bounded)
             scan_limit_sec = self.calibrated_360_duration_sec or self.search_scan_sec
-            if self._context.total_turn_duration_sec >= scan_limit_sec:
+            if (
+                self._context.total_turn_duration_sec >= scan_limit_sec
+                or self._context.sectors_scanned >= self.max_scan_sectors
+            ):
                 calib_note = "calibrated 360" if self._context.is_360_calibrated else "uncalibrated sector scan limit"
-                self._context.terminal_message = f"Full {calib_note} scan completed without finding '{target_class}'."
+                self._context.terminal_message = (
+                    f"Full {calib_note} scan completed ({self._context.sectors_scanned}/{self.max_scan_sectors} pulses, "
+                    f"{self._context.total_turn_duration_sec:.1f}s) without finding '{target_class}'."
+                )
                 self._transition_to(RobotState.TARGET_NOT_FOUND, self._context.terminal_message)
                 return self._state
 
-            # A forward-only sonar cannot verify lateral clearance.
-            if self.ultrasonic_protection_enabled:
-                if not self.distance_sensor:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, "Distance sensor unavailable before search rotation.")
-                    return self._state
+            # Search in-place rotation: ultrasonic clearance is not required to observe or rotate.
+            if self.distance_sensor:
                 try:
                     turn_reading = self.distance_sensor.get_reading()
-                except Exception as exc:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, f"Distance sensor failed before search rotation: {exc}")
-                    return self._state
-                if turn_reading is None or not turn_reading.is_valid:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, "Invalid distance reading before search rotation.")
-                    return self._state
-                if (turn_reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                        or turn_reading.distance_cm <= self.target_stop_distance_cm):
-                    self._transition_to(RobotState.BLOCKED, "Rotation refused: obstacle is close and side clearance is unknown.")
-                    return self._state
+                    if turn_reading and turn_reading.is_valid:
+                        self._context.last_distance_cm = turn_reading.distance_cm
+                except Exception:
+                    pass
 
             # Execute short bounded turn pulse into next sector
-            turn_pulse_sec = 0.25
-            self._turn_pulse(TURN_SPEED, turn_pulse_sec, direction="left")
+            turn_pulse_sec = self.search_turn_pulse_sec
+            sector_idx = self._context.sectors_scanned + 1
+            logger.info(
+                "Search pulse %d/%d active: LEFT @ %.0f%% PWM for %.2fs (cumulative: %.2fs/%.2fs)",
+                sector_idx,
+                self.max_scan_sectors,
+                self.turn_speed * 100.0,
+                turn_pulse_sec,
+                self._context.total_turn_duration_sec + turn_pulse_sec,
+                scan_limit_sec,
+            )
+            self._turn_pulse(self.turn_speed, turn_pulse_sec, direction="left")
             self._context.total_turn_duration_sec += turn_pulse_sec
             self._context.sectors_scanned += 1
             return self._state
@@ -491,37 +574,25 @@ class RobotStateMachine:
         # STATE: CENTERING (Align bounding-box center with frame center)
         # ===================================================================
         if self._state == RobotState.CENTERING:
-            centering_reading = None
-            if self.ultrasonic_protection_enabled:
-                if not self.distance_sensor:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, "Distance sensor unavailable during centering.")
-                    return self._state
+            if self.distance_sensor:
                 try:
                     centering_reading = self.distance_sensor.get_reading()
-                except Exception as exc:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, f"Distance sensor failed during centering: {exc}")
-                    return self._state
-                if centering_reading is None or not centering_reading.is_valid:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, "Invalid distance reading during centering.")
-                    return self._state
-                if (centering_reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                        or centering_reading.distance_cm <= self.config.safety.obstacle_blocked_cm):
-                    self._transition_to(RobotState.BLOCKED, "Centering refused: forward obstacle is inside blocked zone.")
-                    return self._state
-            elif self.distance_sensor:
-                try:
-                    centering_reading = self.distance_sensor.get_reading()
+                    if centering_reading and centering_reading.is_valid:
+                        self._context.last_distance_cm = centering_reading.distance_cm
                 except Exception:
-                    centering_reading = None
+                    pass
 
-            time.sleep(DEFAULT_SETTLING_DELAY_SEC)
+            time.sleep(self.settling_delay_sec)
             det = self._detect_target_in_frame(target_class)
 
             if det is None:
                 self._context.consecutive_target_loss += 1
+                logger.warning(
+                    "Target '%s' not detected during centering (consecutive loss: %d/%d).",
+                    target_class,
+                    self._context.consecutive_target_loss,
+                    self.max_consecutive_target_loss,
+                )
                 if self._context.consecutive_target_loss >= self.max_consecutive_target_loss:
                     self._active_fault = FaultCode.TARGET_LOST
                     self._transition_to(RobotState.FAULT, f"Target '{target_class}' lost during centering.")
@@ -540,32 +611,31 @@ class RobotStateMachine:
                 self._transition_to(RobotState.APPROACHING, f"Target '{target_class}' centered; commencing approach.")
                 return self._state
 
-            if (
-                self.ultrasonic_protection_enabled
-                and centering_reading is not None
-                and centering_reading.distance_cm is not None
-                and centering_reading.distance_cm <= self.target_stop_distance_cm
-            ):
-                self.motors.stop()
-                self._transition_to(RobotState.BLOCKED, "Target is off-centre inside stop zone; refusing a blind in-place turn without side sensors.")
-                return self._state
-
-            # Pulse turn to correct optical error
-            turn_pulse_sec = 0.08  # Micro-pulse
-            if offset < 0:
-                self._turn_pulse(TURN_SPEED, turn_pulse_sec, direction="left")
-            else:
-                self._turn_pulse(TURN_SPEED, turn_pulse_sec, direction="right")
+            # Pulse turn to correct optical error (micro-pulse from config)
+            turn_pulse_sec = self.centering_turn_pulse_sec
+            direction = "left" if offset < 0 else "right"
+            logger.info(
+                "Target not centered (cx=%.1f, offset=%.1fpx, deadband=±%dpx). Commanding %s centering turn (%.2fs @ %.0f%% PWM).",
+                target_cx,
+                offset,
+                self.deadband_pixels,
+                direction.upper(),
+                turn_pulse_sec,
+                self.turn_speed * 100.0,
+            )
+            self._turn_pulse(self.turn_speed, turn_pulse_sec, direction=direction)
             return self._state
 
         # ===================================================================
         # STATE: APPROACHING (Ultrasonic-Gated Forward Pulses)
         # ===================================================================
         if self._state == RobotState.APPROACHING:
-            # 1. Forward Ultrasonic Safety Gate (active only when protection is enabled)
+            # 1. Forward Ultrasonic Safety Gate (Mandatory for forward motion)
             distance_cm = None
             if self.ultrasonic_protection_enabled:
                 if not self.distance_sensor:
+                    if self.motors:
+                        self.motors.stop()
                     self._active_fault = FaultCode.SENSOR_TIMEOUT
                     self._transition_to(RobotState.FAULT, "No distance sensor is attached during approach.")
                     return self._state
@@ -574,24 +644,32 @@ class RobotStateMachine:
                     reading = self.distance_sensor.get_reading()
                 except Exception as exc:
                     logger.error("Distance sensor error during approach: %s", exc)
+                    if self.motors:
+                        self.motors.stop()
                     self._active_fault = FaultCode.SENSOR_TIMEOUT
                     self._transition_to(RobotState.FAULT, "Ultrasonic timeout during approach.")
                     return self._state
 
                 if reading is None or not reading.is_valid:
                     logger.warning("Invalid distance reading during approach.")
+                    if self.motors:
+                        self.motors.stop()
                     self._active_fault = FaultCode.SENSOR_TIMEOUT
                     self._transition_to(RobotState.FAULT, "Invalid ultrasonic measurement during approach.")
                     return self._state
 
+                ts = getattr(reading, "timestamp", 0.0)
+                if ts > 0:
+                    age = time.time() - ts
+                    if age > self.sensor_staleness_sec:
+                        if self.motors:
+                            self.motors.stop()
+                        self._active_fault = FaultCode.SENSOR_TIMEOUT
+                        self._transition_to(RobotState.FAULT, f"Stale distance reading (age {age:.2f}s > {self.sensor_staleness_sec:.2f}s) during approach.")
+                        return self._state
+
                 distance_cm = reading.distance_cm
                 self._context.last_distance_cm = distance_cm
-
-                # Obstacle interlocks always win over target-arrival classification.
-                if (reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                        or (distance_cm is not None and distance_cm <= self.config.safety.obstacle_blocked_cm)):
-                    self._transition_to(RobotState.BLOCKED, f"Obstacle detected ahead at {distance_cm:.1f} cm.")
-                    return self._state
             elif self.distance_sensor:
                 try:
                     reading = self.distance_sensor.get_reading()
@@ -601,14 +679,37 @@ class RobotStateMachine:
                 except Exception:
                     pass
 
-            # Reconfirm the requested target in a fresh frame before claiming arrival
-            # or issuing another forward pulse. A stale detection is not sufficient.
-            time.sleep(DEFAULT_SETTLING_DELAY_SEC)
+            if distance_cm is None:
+                if self.motors:
+                    self.motors.stop()
+                self._active_fault = FaultCode.SENSOR_TIMEOUT
+                self._transition_to(RobotState.FAULT, "Cannot approach target: ultrasonic distance reading is None.")
+                return self._state
+
+            # 2. Critical obstacle safety floor (< 15 cm)
+            if distance_cm <= self.config.safety.obstacle_critical_cm:
+                if self.motors:
+                    self.motors.stop()
+                self._transition_to(RobotState.BLOCKED, f"Obstacle inside critical zone at {distance_cm:.1f} cm.")
+                return self._state
+
+            # 3. Observe fresh camera frame before deciding motion or arrival
+            time.sleep(self.settling_delay_sec)
             det = self._detect_target_in_frame(target_class)
+
             if det is None:
                 self._context.consecutive_target_loss += 1
                 if self.motors:
                     self.motors.stop()
+                logger.warning(
+                    "Target '%s' not detected on approach (reacquisition %d/%d); robot stationary.",
+                    target_class,
+                    self._context.consecutive_target_loss,
+                    self.max_consecutive_target_loss,
+                )
+                if distance_cm <= self.config.safety.obstacle_blocked_cm:
+                    self._transition_to(RobotState.BLOCKED, f"Obstacle detected ahead at {distance_cm:.1f} cm (target absent).")
+                    return self._state
                 if self._context.consecutive_target_loss >= self.max_consecutive_target_loss:
                     self._active_fault = FaultCode.TARGET_LOST
                     self._transition_to(RobotState.FAULT, f"Target '{target_class}' lost during approach.")
@@ -617,65 +718,114 @@ class RobotStateMachine:
             self._context.consecutive_target_loss = 0
             self._context.target_detection = det
 
-            # Refresh the cached reading after inference if protection enabled
-            if self.ultrasonic_protection_enabled:
-                try:
-                    latest_reading = self.distance_sensor.get_reading()
-                except Exception as exc:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, f"Ultrasonic refresh failed before approach actuation: {exc}")
-                    return self._state
-                if latest_reading is None or not latest_reading.is_valid:
-                    self._active_fault = FaultCode.SENSOR_TIMEOUT
-                    self._transition_to(RobotState.FAULT, "Ultrasonic reading invalid before approach actuation.")
-                    return self._state
-                distance_cm = latest_reading.distance_cm
-                self._context.last_distance_cm = distance_cm
-                if (latest_reading.state in (ObstacleState.BLOCKED, ObstacleState.CRITICAL)
-                        or distance_cm <= self.config.safety.obstacle_blocked_cm):
-                    self._transition_to(RobotState.BLOCKED, f"Obstacle detected at {distance_cm:.1f} cm before actuation.")
-                    return self._state
-
+            # 4. Check Optical Alignment (Centering deadband)
             frame_center_x = self.camera_width / 2.0
             offset = det.box_xywh[0] - frame_center_x
-            if abs(offset) > self.deadband_pixels and distance_cm is not None and distance_cm <= self.target_stop_distance_cm:
-                self.motors.stop()
-                self._transition_to(RobotState.BLOCKED, "Target is off-centre inside the stop zone; side clearance is unknown.")
-                return self._state
             if abs(offset) > self.deadband_pixels:
-                logger.info("Target drifted out of deadband (offset=%.1fpx); re-centering.", offset)
-                self._transition_to(RobotState.CENTERING, "Optical centering correction required.")
+                if self.motors:
+                    self.motors.stop()
+                logger.info("Target drifted out of centering deadband (offset=%.1fpx > %dpx); re-centering.", offset, self.deadband_pixels)
+                self._transition_to(RobotState.CENTERING, f"Target '{target_class}' drifted out of centering deadband.")
                 return self._state
 
-            # Target arrival is allowed only in the warning/clear band, outside
-            # BLOCKED/CRITICAL. Bounding-box area is never used as distance.
-            if distance_cm is not None:
-                if distance_cm <= self.config.safety.obstacle_blocked_cm:
-                    self._transition_to(RobotState.BLOCKED, f"Obstacle detected ahead at {distance_cm:.1f} cm.")
-                    return self._state
-                if distance_cm <= self.target_stop_distance_cm:
-                    self._context.terminal_message = (
-                        f"Requested target centred; ultrasonic distance {distance_cm:.1f} cm "
-                        f"is within safe stop threshold {self.target_stop_distance_cm:.1f} cm."
-                    )
-                    self._transition_to(RobotState.TARGET_REACHED, self._context.terminal_message)
+            # 5. Refresh ultrasonic reading right before motion/arrival decision
+            if self.ultrasonic_protection_enabled:
+                try:
+                    fresh_reading = self.distance_sensor.get_reading()
+                    if fresh_reading is not None and fresh_reading.is_valid:
+                        distance_cm = fresh_reading.distance_cm
+                        self._context.last_distance_cm = distance_cm
+                    else:
+                        if self.motors:
+                            self.motors.stop()
+                        self._active_fault = FaultCode.SENSOR_TIMEOUT
+                        self._transition_to(RobotState.FAULT, "Ultrasonic reading invalid before approach actuation.")
+                        return self._state
+                except Exception as exc:
+                    if self.motors:
+                        self.motors.stop()
+                    self._active_fault = FaultCode.SENSOR_TIMEOUT
+                    self._transition_to(RobotState.FAULT, f"Ultrasonic read error before actuation: {exc}")
                     return self._state
 
-            # Execute one short, bounded forward pulse only after fresh perception
-            # and valid clear/warning-band proximity checks.
-            forward_pulse_sec = DEFAULT_APPROACH_PULSE_SEC
-            self._forward_pulse(APPROACH_SPEED, forward_pulse_sec)
+            # 6. Target standoff arrival & obstacle safety policy
+            blocked_threshold = self.config.safety.obstacle_blocked_cm
+            standoff_threshold = self.target_stop_distance_cm
+
+            # A distance inside the blocked zone is always a safety block.
+            # When standoff > blocked, reaching the blocked zone is a block, not arrival.
+            # When standoff == blocked, only strictly below blocked is a block.
+            is_blocked = (distance_cm < blocked_threshold) or (
+                standoff_threshold > blocked_threshold and distance_cm <= blocked_threshold
+            )
+
+            if is_blocked:
+                if self.motors:
+                    self.motors.stop()
+                self._transition_to(RobotState.BLOCKED, f"Obstacle detected ahead at {distance_cm:.1f} cm.")
+                return self._state
+
+            if distance_cm <= standoff_threshold:
+                if self.motors:
+                    self.motors.stop()
+                self._context.terminal_message = (
+                    f"Requested target centred; ultrasonic distance {distance_cm:.1f} cm "
+                    f"is within safe stop threshold {standoff_threshold:.1f} cm."
+                )
+                self._transition_to(RobotState.TARGET_REACHED, self._context.terminal_message)
+                return self._state
+
+            # 7. Hard forward-motion safety threshold at 25 cm
+            # At or below 25 cm, no new forward pulse may start!
+            if distance_cm <= 25.0:
+                if self.motors:
+                    self.motors.stop()
+                return self._state
+
+            # 8. Clear path (> 25 cm and > standoff): execute one bounded forward pulse
+            forward_pulse_sec = self.approach_pulse_sec
+            self._forward_pulse(self.approach_speed, forward_pulse_sec)
             return self._state
 
         return self._state
+
+    def _is_valid_detection(self, det: Any) -> bool:
+        """Validate detection result structure and bounding box invariants."""
+        if det is None:
+            return False
+        box = getattr(det, "box_xywh", None)
+        if not isinstance(box, (tuple, list)) or len(box) < 4:
+            return False
+        try:
+            cx, cy, w, h = box[0], box[1], box[2], box[3]
+            if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (cx, cy, w, h)):
+                return False
+            if w <= 0 or h <= 0:
+                return False
+            if cx < -100 or cx > self.camera_width + 100:
+                return False
+        except Exception:
+            return False
+        return True
 
     def _detect_target_in_frame(self, target_class: str) -> Optional[DetectionResult]:
         """Capture fresh optical frame and run YOLO inference for the target class."""
         if not self.camera or not self.detector:
             return None
 
+        if hasattr(self.camera, "is_operational") and not self.camera.is_operational:
+            logger.error("Camera is degraded or not operational.")
+            self._active_fault = FaultCode.CAMERA_FRAME_DROP
+            self._transition_to(RobotState.FAULT, "Camera hardware is degraded/unoperational.")
+            return None
+
+        frame = None
         try:
             frame = self.camera.capture_frame()
+            if frame is None and hasattr(self.camera, "is_operational") and self.camera.is_operational:
+                # If camera is operational, allow background thread a brief moment to produce fresh frame
+                time.sleep(0.06)
+                frame = self.camera.capture_frame()
         except Exception as exc:
             logger.error("Camera capture failure: %s", exc)
             self._active_fault = FaultCode.CAMERA_FRAME_DROP
@@ -683,18 +833,32 @@ class RobotStateMachine:
             return None
 
         if frame is None:
-            logger.warning("Camera returned dropped or stale frame.")
+            self._consecutive_camera_drops += 1
+            logger.warning("Camera returned dropped or stale frame (drop count: %d).", self._consecutive_camera_drops)
+            if self._consecutive_camera_drops >= 3:
+                self._active_fault = FaultCode.CAMERA_FRAME_DROP
+                self._transition_to(RobotState.FAULT, "Camera frame capture dropped repeatedly (3 consecutive drops).")
             return None
 
+        self._consecutive_camera_drops = 0
+
         try:
+            target_det = None
             if hasattr(self.detector, "detect_target"):
-                return self.detector.detect_target(frame, target_class)
+                target_det = self.detector.detect_target(frame, target_class)
             elif hasattr(self.detector, "detect"):
                 results = self.detector.detect(frame)
-                for r in results:
-                    if r.class_name == target_class:
-                        return r
-            return None
+                if isinstance(results, (list, tuple)):
+                    for r in results:
+                        if getattr(r, "class_name", None) == target_class:
+                            target_det = r
+                            break
+
+            if target_det is not None and not self._is_valid_detection(target_det):
+                logger.warning("Detector returned malformed detection for '%s': %s", target_class, target_det)
+                return None
+
+            return target_det
         except Exception as exc:
             logger.error("Inference failure in detector: %s", exc)
             self._active_fault = FaultCode.WATCHDOG_TIMEOUT
@@ -707,11 +871,15 @@ class RobotStateMachine:
             return
 
         active_states = (RobotState.SEARCHING, RobotState.CENTERING)
+        if self._emergency_stop_latched or self._state not in active_states:
+            return
+
         try:
             if direction == "left":
                 self.motors.set_speeds(-speed, speed)
             else:
                 self.motors.set_speeds(speed, -speed)
+            logger.info("Turn pulse active: %s @ %.0f%% PWM for %.2fs", direction.upper(), speed * 100.0, duration_sec)
             t_end = time.time() + duration_sec
             while time.time() < t_end:
                 if self._emergency_stop_latched or self._state not in active_states:
@@ -720,21 +888,55 @@ class RobotStateMachine:
         except Exception as exc:
             logger.error("Motor turn pulse error: %s", exc)
         finally:
-            self.motors.stop()
+            if self._state != RobotState.MANUAL_MOVEMENT and self.motors:
+                try:
+                    self.motors.stop()
+                except Exception as exc:
+                    logger.error("Error stopping motors after turn pulse: %s", exc)
 
     def _forward_pulse(self, speed: float, duration_sec: float) -> None:
-        """Execute a short bounded forward movement pulse with responsive preemption."""
+        """Execute a short bounded forward movement pulse with responsive preemption and ultrasonic gating."""
         if not self.motors:
             return
 
+        if self._emergency_stop_latched or self._state != RobotState.APPROACHING:
+            return
+
+        # Hard forward-motion safety threshold at 25 cm:
+        # At or below 25 cm, no new forward pulse may start!
+        if self.ultrasonic_protection_enabled and self.distance_sensor:
+            try:
+                pre_chk = self.distance_sensor.get_reading()
+                if pre_chk is not None and pre_chk.distance_cm is not None and pre_chk.distance_cm <= 25.0:
+                    self.motors.stop()
+                    return
+            except Exception:
+                self.motors.stop()
+                return
+
         try:
             self.motors.set_speeds(speed, speed)
+            logger.info("Forward pulse active: speed=%.0f%% PWM for %.2fs", speed * 100.0, duration_sec)
             t_end = time.time() + duration_sec
+            last_chk = time.time()
             while time.time() < t_end:
                 if self._emergency_stop_latched or self._state != RobotState.APPROACHING:
                     break
+                now = time.time()
+                if self.ultrasonic_protection_enabled and self.distance_sensor and (now - last_chk >= 0.05):
+                    last_chk = now
+                    try:
+                        cur_rd = self.distance_sensor.get_reading()
+                        if cur_rd and cur_rd.distance_cm is not None and cur_rd.distance_cm <= 25.0:
+                            break
+                    except Exception:
+                        break
                 time.sleep(0.02)
         except Exception as exc:
             logger.error("Motor forward pulse error: %s", exc)
         finally:
-            self.motors.stop()
+            if self._state != RobotState.MANUAL_MOVEMENT and self.motors:
+                try:
+                    self.motors.stop()
+                except Exception as exc:
+                    logger.error("Error stopping motors after forward pulse: %s", exc)

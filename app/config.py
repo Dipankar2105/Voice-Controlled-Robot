@@ -32,8 +32,15 @@ from app.constants import (
     CAMERA_WIDTH,
     CRITICAL_OBSTACLE_DISTANCE_CM,
     DEADBAND_PIXELS,
+    DEFAULT_APPROACH_PULSE_SEC,
+    DEFAULT_CENTERING_TURN_PULSE_SEC,
     DEFAULT_MANUAL_SPEED,
     DEFAULT_MANUAL_PULSE_SEC,
+    DEFAULT_MIN_CONFIRMATIONS,
+    DEFAULT_MISSION_TIMEOUT_SEC,
+    DEFAULT_SEARCH_TURN_PULSE_SEC,
+    DEFAULT_SENSOR_STALENESS_SEC,
+    DEFAULT_SETTLING_DELAY_SEC,
     ExecutionMode,
     MAX_SPEED,
     MAX_ULTRASONIC_DISTANCE_CM,
@@ -122,6 +129,12 @@ class MotionConfig:
     search_scan_duration_sec: float = 12.0
     calibrated_360_duration_sec: Optional[float] = None
     manual_pulse_sec: float = DEFAULT_MANUAL_PULSE_SEC
+    search_turn_pulse_sec: float = DEFAULT_SEARCH_TURN_PULSE_SEC
+    centering_turn_pulse_sec: float = DEFAULT_CENTERING_TURN_PULSE_SEC
+    approach_pulse_sec: float = DEFAULT_APPROACH_PULSE_SEC
+    settling_delay_sec: float = DEFAULT_SETTLING_DELAY_SEC
+    left_trim: float = 1.00
+    right_trim: float = 1.00
 
 
 @dataclass(frozen=True)
@@ -131,6 +144,8 @@ class SafetyConfig:
     obstacle_critical_cm: float = CRITICAL_OBSTACLE_DISTANCE_CM
     target_stop_distance_cm: float = TARGET_STOP_DISTANCE_CM
     watchdog_timeout_sec: float = 2.0
+    mission_timeout_sec: float = DEFAULT_MISSION_TIMEOUT_SEC
+    sensor_staleness_sec: float = DEFAULT_SENSOR_STALENESS_SEC
     max_consecutive_target_loss: int = 3
 
 
@@ -153,6 +168,7 @@ class VisionConfig:
     deadband_pixels: int = DEADBAND_PIXELS
     target_reached_area: int = TARGET_REACHED_AREA
     detect_frequency_hz: int = 6
+    min_confirmations: int = DEFAULT_MIN_CONFIRMATIONS
     class_metadata_path: str = REL_PATH_CLASS_METADATA
 
 
@@ -250,13 +266,51 @@ class AppConfig:
             raise ConfigurationError(
                 f"manual_pulse_sec ({self.motion.manual_pulse_sec}) must be within [0.01, 2.0] seconds."
             )
+        if not (0.01 <= self.motion.search_turn_pulse_sec <= 2.0):
+            raise ConfigurationError(
+                f"search_turn_pulse_sec ({self.motion.search_turn_pulse_sec}) must be within [0.01, 2.0] seconds."
+            )
+        if not (0.01 <= self.motion.centering_turn_pulse_sec <= 1.0):
+            raise ConfigurationError(
+                f"centering_turn_pulse_sec ({self.motion.centering_turn_pulse_sec}) must be within [0.01, 1.0] seconds."
+            )
+        if not (0.01 <= self.motion.approach_pulse_sec <= 1.0):
+            raise ConfigurationError(
+                f"approach_pulse_sec ({self.motion.approach_pulse_sec}) must be within [0.01, 1.0] seconds."
+            )
+        if not (0.0 <= self.motion.settling_delay_sec <= 1.0):
+            raise ConfigurationError(
+                f"settling_delay_sec ({self.motion.settling_delay_sec}) must be within [0.0, 1.0] seconds."
+            )
+        if not (1.0 <= self.motion.search_scan_duration_sec <= 60.0):
+            raise ConfigurationError(
+                f"search_scan_duration_sec ({self.motion.search_scan_duration_sec}) must be within [1.0, 60.0] seconds."
+            )
+        if not (1.0 <= self.safety.mission_timeout_sec <= 300.0):
+            raise ConfigurationError(
+                f"mission_timeout_sec ({self.safety.mission_timeout_sec}) must be within [1.0, 300.0] seconds."
+            )
+        if not (0.05 <= self.safety.sensor_staleness_sec <= 5.0):
+            raise ConfigurationError(
+                f"sensor_staleness_sec ({self.safety.sensor_staleness_sec}) must be within [0.05, 5.0] seconds."
+            )
+        for trim_name, trim_val in (("left_trim", self.motion.left_trim), ("right_trim", self.motion.right_trim)):
+            if not (0.10 <= trim_val <= 1.00):
+                raise ConfigurationError(
+                    f"Speed trim '{trim_name}'={trim_val} violates valid range [0.10, 1.00]."
+                )
+        if self.motion.calibrated_360_duration_sec is not None:
+            if not (1.0 <= self.motion.calibrated_360_duration_sec <= 60.0):
+                raise ConfigurationError(
+                    f"calibrated_360_duration_sec ({self.motion.calibrated_360_duration_sec}) must be within [1.0, 60.0] seconds."
+                )
 
         # 5. Ultrasonic Safety Threshold Monotonicity
         if not (
             self.ultrasonic.min_distance_cm
             <= self.safety.obstacle_critical_cm
             < self.safety.obstacle_blocked_cm
-            < self.safety.target_stop_distance_cm
+            <= self.safety.target_stop_distance_cm
             < self.safety.obstacle_warning_cm
             < self.ultrasonic.max_distance_cm
         ):
@@ -264,7 +318,7 @@ class AppConfig:
                 "Obstacle safety thresholds violate mandatory monotonic ordering: "
                 f"min({self.ultrasonic.min_distance_cm}) <= "
                 f"critical({self.safety.obstacle_critical_cm}) < "
-                f"blocked({self.safety.obstacle_blocked_cm}) < "
+                f"blocked({self.safety.obstacle_blocked_cm}) <= "
                 f"target_stop({self.safety.target_stop_distance_cm}) < "
                 f"warning({self.safety.obstacle_warning_cm}) < "
                 f"max({self.ultrasonic.max_distance_cm}). Target stop must be outside the blocked zone."
@@ -413,6 +467,12 @@ def load_config_from_dict(d: Dict[str, Any]) -> AppConfig:
         if motion.get("calibrated_360_duration_sec") is not None
         else None,
         manual_pulse_sec=float(motion.get("manual_pulse_sec", DEFAULT_MANUAL_PULSE_SEC)),
+        search_turn_pulse_sec=float(motion.get("search_turn_pulse_sec", DEFAULT_SEARCH_TURN_PULSE_SEC)),
+        centering_turn_pulse_sec=float(motion.get("centering_turn_pulse_sec", DEFAULT_CENTERING_TURN_PULSE_SEC)),
+        approach_pulse_sec=float(motion.get("approach_pulse_sec", DEFAULT_APPROACH_PULSE_SEC)),
+        settling_delay_sec=float(motion.get("settling_delay_sec", DEFAULT_SETTLING_DELAY_SEC)),
+        left_trim=float(motion.get("left_trim", 1.00)),
+        right_trim=float(motion.get("right_trim", 1.00)),
     )
 
     safety_cfg = SafetyConfig(
@@ -421,6 +481,8 @@ def load_config_from_dict(d: Dict[str, Any]) -> AppConfig:
         obstacle_critical_cm=float(safety.get("obstacle_critical_cm", CRITICAL_OBSTACLE_DISTANCE_CM)),
         target_stop_distance_cm=float(safety.get("target_stop_distance_cm", TARGET_STOP_DISTANCE_CM)),
         watchdog_timeout_sec=float(safety.get("watchdog_timeout_sec", 2.0)),
+        mission_timeout_sec=float(safety.get("mission_timeout_sec", DEFAULT_MISSION_TIMEOUT_SEC)),
+        sensor_staleness_sec=float(safety.get("sensor_staleness_sec", DEFAULT_SENSOR_STALENESS_SEC)),
         max_consecutive_target_loss=int(safety.get("max_consecutive_target_loss", 3)),
     )
 
@@ -441,6 +503,7 @@ def load_config_from_dict(d: Dict[str, Any]) -> AppConfig:
         deadband_pixels=int(vis.get("deadband_pixels", DEADBAND_PIXELS)),
         target_reached_area=int(vis.get("target_reached_area", TARGET_REACHED_AREA)),
         detect_frequency_hz=int(vis.get("detect_frequency_hz", 6)),
+        min_confirmations=int(vis.get("min_confirmations", DEFAULT_MIN_CONFIRMATIONS)),
         class_metadata_path=str(vis.get("class_metadata_path", REL_PATH_CLASS_METADATA)),
     )
 

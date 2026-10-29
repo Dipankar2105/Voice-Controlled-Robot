@@ -242,6 +242,14 @@ class ONNXYOLODetector(DetectorInterface):
         self._name_to_id = {v: k for k, v in self._id_to_name.items()}
         self._is_ready = True
 
+        # Safe warm-up pass to compile execution graph and prevent latency spike on first mission step
+        try:
+            dummy_input = np.zeros((1, 3, self.input_height, self.input_width), dtype=np.float32)
+            self._session.run([self._output_name], {self._input_name: dummy_input})
+            logger.debug("YOLO detector warm-up pass completed successfully.")
+        except Exception as exc:
+            logger.debug("Non-fatal warm-up pass notice: %s", exc)
+
         logger.info(
             "YOLO ONNX model loaded successfully (%d classes, input: %s, output: %s).",
             len(self._id_to_name),

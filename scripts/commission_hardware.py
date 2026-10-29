@@ -90,11 +90,14 @@ def run_commissioning(interactive: bool = True, force_mock: bool = False) -> int
         response = input("\nExecute 0.20-second forward pulse now? (yes/no): ").strip().lower()
         if response == "yes":
             print("Pulsing motors forward for 0.20 seconds...")
-            motors.move_pulse(left=0.30, right=0.30, duration_sec=0.20)
-            print("Motors stopped. PWM set to 0%, directional pins LOW.")
-            direction_ok = input("Did left and right wheels rotate FORWARD? (yes/no): ").strip().lower()
-            if direction_ok != "yes":
-                print("[WARNING] Motor polarity mismatch detected! Swap IN1/IN2 or IN3/IN4 wires.")
+            pulse_accepted = motors.move_pulse(left=0.30, right=0.30, duration_sec=0.20)
+            if not pulse_accepted:
+                print("[ERROR] Motor pulse rejected or unavailable: controller uninitialized, disabled, or invalid command.")
+            else:
+                print("Pulse command completed. PWM set to 0%, directional pins LOW.")
+                direction_ok = input("Did left and right wheels physically rotate FORWARD? (yes/no): ").strip().lower()
+                if direction_ok != "yes":
+                    print("[WARNING] Motor polarity mismatch or no physical movement detected! Check wiring, common GND, and battery cutoff switch.")
         else:
             print("Motor actuation skipped by operator.")
 

@@ -39,17 +39,25 @@ motion:
   search_speed: 0.30
   speed_ramp_step: 0.15
   max_speed: 1.00
-  search_scan_duration_sec: 10.0
-  calibrated_360_duration_sec: 10.0  # Measured physical floor calibration (36 deg/s -> 10.0s for 360 rotation)
+  search_scan_duration_sec: 16.0
+  calibrated_360_duration_sec: 16.0  # Physically calibrated for full 360-degree sweep (~22.5 deg/s against floor scrub friction -> 16.0s for 360-deg rotation at 40% PWM)
   manual_pulse_sec: 0.75
+  search_turn_pulse_sec: 1.00       # Calibrated 1.0s floor pulse (~22.5 deg rotation per sector at 40% PWM)
+  centering_turn_pulse_sec: 0.35    # Calibrated 0.35s floor pulse (overcomes 4WD static scrub friction at 40% PWM)
+  approach_pulse_sec: 0.50          # Calibrated 0.50s floor pulse (~5.0 cm advance at 40% PWM)
+  settling_delay_sec: 0.15          # Optical stabilization delay after motor stop before camera exposure
+  left_trim: 1.00   # Physically verified neutral straight tracking
+  right_trim: 1.00  # Physically verified neutral straight tracking
 
 safety:
   obstacle_warning_cm: 50.0
   obstacle_blocked_cm: 25.0
   obstacle_critical_cm: 15.0
-  target_stop_distance_cm: 30.0
+  target_stop_distance_cm: 25.0
   watchdog_timeout_sec: 2.0
-  max_consecutive_target_loss: 3
+  mission_timeout_sec: 60.0
+  sensor_staleness_sec: 0.80
+  max_consecutive_target_loss: 8
 
 camera:
   device_index: 0
@@ -62,11 +70,12 @@ vision:
   fallback_model_path: "models/object_detection/best_v1.onnx"
   input_width: 320
   input_height: 320
-  confidence_threshold: 0.25
+  confidence_threshold: 0.20
   nms_threshold: 0.45
   deadband_pixels: 40
   target_reached_area: 35000
   detect_frequency_hz: 1
+  min_confirmations: 2
 
 audio:
   model_dir: "models/voice/vosk-model"

@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from app.constants import ExecutionMode
 from app.logger import get_logger
@@ -56,7 +56,7 @@ class FakePWMChannel(PWMChannel):
 
     def __init__(self, pin: int, frequency_hz: float):
         self.pin = pin
-        self.frequency_hz = frequency_hz
+        self.frequency_hz = max(1.0, float(frequency_hz))
         self.duty_cycle: float = 0.0
         self.is_running: bool = False
 
@@ -99,7 +99,7 @@ class GPIOAdapter(ABC):
         """Create a PWM instance on the given pin."""
 
     @abstractmethod
-    def cleanup(self, pins: Optional[List[int]] = None) -> None:
+    def cleanup(self, pins: Optional[Union[Sequence[int], int]] = None) -> None:
         """Reset pin modes and release GPIO resources."""
 
 
@@ -149,16 +149,17 @@ class FakeGPIOAdapter(GPIOAdapter):
         self.pwm_channels[pin] = pwm
         return pwm
 
-    def cleanup(self, pins: Optional[List[int]] = None) -> None:
-        if pins:
-            for p in pins:
+    def cleanup(self, pins: Optional[Union[Sequence[int], int]] = None) -> None:
+        if pins is not None:
+            pin_list = [pins] if isinstance(pins, int) else list(pins)
+            for p in pin_list:
                 self.pin_values[p] = LOW
                 self.pin_modes.pop(p, None)
                 if p in self.pwm_channels:
                     self.pwm_channels[p].stop()
                     self.pwm_channels.pop(p, None)
         else:
-            for p in self.pwm_channels.values():
+            for p in list(self.pwm_channels.values()):
                 p.stop()
             self.pwm_channels.clear()
             self.pin_values.clear()
@@ -183,6 +184,8 @@ class RPiGPIOAdapter(GPIOAdapter):
             ) from exc
 
     def setmode(self, mode: int) -> None:
+        if mode != BCM and mode != self._gpio.BCM:
+            logger.warning("RPiGPIOAdapter requires BCM mode; requested %s, enforcing BCM.", mode)
         self._gpio.setmode(self._gpio.BCM)
 
     def setup(self, pin: int, mode: int, pull_up_down: int = PUD_OFF, initial: int = LOW) -> None:
@@ -208,26 +211,51 @@ class RPiGPIOAdapter(GPIOAdapter):
         class RPiPWMChannel(PWMChannel):
             def __init__(self, raw_pwm):
                 self._raw = raw_pwm
+                self._is_stopped = False
 
             def start(self, duty_cycle: float) -> None:
-                self._raw.start(duty_cycle)
+                clamped = max(0.0, min(100.0, float(duty_cycle)))
+                try:
+                    self._raw.start(clamped)
+                    self._is_stopped = False
+                except Exception as exc:
+                    logger.error("Error starting PWM: %s", exc)
+                    raise
 
             def ChangeDutyCycle(self, duty_cycle: float) -> None:
-                self._raw.ChangeDutyCycle(duty_cycle)
+                clamped = max(0.0, min(100.0, float(duty_cycle)))
+                try:
+                    self._raw.ChangeDutyCycle(clamped)
+                except Exception as exc:
+                    logger.error("Error setting PWM duty cycle (%.1f%%): %s", clamped, exc)
+                    raise
 
             def ChangeFrequency(self, frequency_hz: float) -> None:
-                self._raw.ChangeFrequency(frequency_hz)
+                freq = max(1.0, float(frequency_hz))
+                try:
+                    self._raw.ChangeFrequency(freq)
+                except Exception as exc:
+                    logger.error("Error changing PWM frequency (%.1f Hz): %s", freq, exc)
+                    raise
 
             def stop(self) -> None:
-                self._raw.stop()
+                if self._is_stopped:
+                    return
+                try:
+                    self._raw.stop()
+                except Exception as exc:
+                    logger.debug("Non-fatal exception stopping PWM channel: %s", exc)
+                finally:
+                    self._is_stopped = True
 
-        raw = self._gpio.PWM(pin, frequency_hz)
+        raw = self._gpio.PWM(pin, max(1.0, float(frequency_hz)))
         return RPiPWMChannel(raw)
 
-    def cleanup(self, pins: Optional[List[int]] = None) -> None:
+    def cleanup(self, pins: Optional[Union[Sequence[int], int]] = None) -> None:
         try:
-            if pins:
-                self._gpio.cleanup(pins)
+            if pins is not None:
+                pin_list = [pins] if isinstance(pins, int) else list(pins)
+                self._gpio.cleanup(pin_list)
             else:
                 self._gpio.cleanup()
         except Exception as exc:

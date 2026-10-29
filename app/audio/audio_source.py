@@ -65,17 +65,28 @@ def convert_and_resample_pcm(
     target_sample_rate: int = AUDIO_SAMPLE_RATE,
 ) -> bytes:
     """Convert input numpy array to 16-bit signed PCM mono at 16000 Hz."""
+    if raw_samples is None or raw_samples.size == 0:
+        return b""
+
     # Convert multi-channel to mono by averaging channels
     if raw_samples.ndim > 1 and raw_samples.shape[1] > 1:
         mono_samples = np.mean(raw_samples, axis=1)
     else:
         mono_samples = raw_samples.flatten()
 
+    if len(mono_samples) == 0:
+        return b""
+
+    # Handle non-finite values (NaN / Inf) safely
+    if np.issubdtype(mono_samples.dtype, np.floating):
+        if not np.all(np.isfinite(mono_samples)):
+            mono_samples = np.nan_to_num(mono_samples, nan=0.0, posinf=1.0, neginf=-1.0)
+
     # Resample if needed
     if input_sample_rate != target_sample_rate and len(mono_samples) > 0:
         # Linear interpolation resampling
         old_indices = np.linspace(0, len(mono_samples) - 1, len(mono_samples))
-        new_length = int(len(mono_samples) * (target_sample_rate / input_sample_rate))
+        new_length = max(1, int(len(mono_samples) * (target_sample_rate / input_sample_rate)))
         new_indices = np.linspace(0, len(mono_samples) - 1, new_length)
         mono_samples = np.interp(new_indices, old_indices, mono_samples)
 
@@ -103,7 +114,7 @@ class MicrophoneAudioSource(AudioSourceInterface):
         max_buffered_chunks: int = 50,  # ~3.2 seconds at 16 kHz / 1024 chunk
     ):
         self.config = config or AudioConfig()
-        self.requested_device_index = device_index
+        self.requested_device_index = device_index if device_index is not None else getattr(self.config, "device_index", None)
         self.max_buffered_chunks = max(5, int(max_buffered_chunks))
 
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=self.max_buffered_chunks)
@@ -117,31 +128,55 @@ class MicrophoneAudioSource(AudioSourceInterface):
     def active_device_index(self) -> Optional[int]:
         return self._active_device_index
 
+    @property
+    def is_streaming(self) -> bool:
+        with self._lock:
+            return self._is_streaming
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._is_closed
+
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         """SoundDevice callback called from low-level audio driver thread."""
-        if not self._is_streaming:
+        if not self._is_streaming or self._is_closed:
             return
 
-        pcm_bytes = convert_and_resample_pcm(
-            indata,
-            input_sample_rate=self.config.sample_rate,
-            target_sample_rate=AUDIO_SAMPLE_RATE,
-        )
+        if status:
+            logger.warning("Sounddevice status reported: %s", status)
 
         try:
-            self._audio_queue.put_nowait(pcm_bytes)
-        except queue.Full:
-            # Buffer overrun: drop oldest chunk to maintain real-time latency
+            if indata is None or indata.size == 0:
+                return
+
+            pcm_bytes = convert_and_resample_pcm(
+                indata,
+                input_sample_rate=self.config.sample_rate,
+                target_sample_rate=AUDIO_SAMPLE_RATE,
+            )
+
+            if not pcm_bytes:
+                return
+
             try:
-                self._audio_queue.get_nowait()
                 self._audio_queue.put_nowait(pcm_bytes)
-            except Exception:
-                pass
+            except queue.Full:
+                # Buffer overrun: drop oldest chunk to maintain real-time latency
+                try:
+                    self._audio_queue.get_nowait()
+                    self._audio_queue.put_nowait(pcm_bytes)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.error("Exception in audio stream callback: %s", exc)
 
     def start_stream(self) -> None:
         """Start audio stream acquisition."""
         with self._lock:
-            if self._is_streaming or self._is_closed:
+            if self._is_closed:
+                raise RuntimeError("Cannot start audio stream on a closed MicrophoneAudioSource")
+            if self._is_streaming:
                 return
 
             import sounddevice as sd
@@ -174,6 +209,12 @@ class MicrophoneAudioSource(AudioSourceInterface):
             except Exception as exc:
                 logger.error("Failed to start sounddevice audio stream: %s", exc)
                 self._is_streaming = False
+                if self._stream:
+                    try:
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
                 raise
 
     def read_chunk(self) -> Optional[bytes]:

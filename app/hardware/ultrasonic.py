@@ -72,6 +72,7 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
         self._consecutive_faults: int = 0
 
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
 
     @property
@@ -92,30 +93,52 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
             if self._is_initialized:
                 return
 
-            self.gpio.setmode(BCM)
-            self.gpio.setup(self.config.trig_pin, OUT, initial=LOW)
-            self.gpio.setup(self.config.echo_pin, IN, pull_up_down=PUD_DOWN)
+            try:
+                self.gpio.setmode(BCM)
+                self.gpio.setup(self.config.trig_pin, OUT, initial=LOW)
+                self.gpio.setup(self.config.echo_pin, IN, pull_up_down=PUD_DOWN)
 
-            # Settle sensor
-            time.sleep(0.02)
-            self._is_initialized = True
-            logger.info(
-                "HC-SR04 initialized (TRIG: %d, ECHO: %d). Pull-down active on ECHO.",
-                self.config.trig_pin,
-                self.config.echo_pin,
-            )
+                # Settle sensor
+                time.sleep(0.02)
+                self._is_initialized = True
+                logger.info(
+                    "HC-SR04 initialized (TRIG: %d, ECHO: %d). Pull-down active on ECHO.",
+                    self.config.trig_pin,
+                    self.config.echo_pin,
+                )
+            except Exception as exc:
+                self._is_initialized = False
+                logger.error("Failed to initialize HC-SR04: %s", exc)
+                try:
+                    self.gpio.cleanup([self.config.trig_pin, self.config.echo_pin])
+                except Exception:
+                    pass
+                raise
 
     def sample_distance_cm(self) -> UltrasonicReading:
         """Execute a single acoustic trigger-echo flight time measurement."""
         now = time.time()
         if not self._is_initialized:
-            self.initialize()
+            try:
+                self.initialize()
+            except Exception as exc:
+                logger.error("Auto-initialization failed during sample_distance_cm: %s", exc)
+                return UltrasonicReading.create_fault(now)
 
         # 1. Pre-trigger settle check:
         # If ECHO pin is stuck HIGH from ringing or a previous echo, wait up to 15 ms to settle LOW.
         # If still HIGH, fail closed without sending trigger.
         t_settle_start = time.perf_counter()
-        while self.gpio.input(self.config.echo_pin) == HIGH:
+        while True:
+            try:
+                val = self.gpio.input(self.config.echo_pin)
+            except Exception as exc:
+                logger.error("GPIO error reading ECHO pin during pre-trigger settle: %s", exc)
+                return UltrasonicReading.create_fault(time.time())
+
+            if val == LOW:
+                break
+
             if (time.perf_counter() - t_settle_start) > 0.015:
                 logger.debug("Ultrasonic settle failed: ECHO stuck HIGH before trigger.")
                 return UltrasonicReading(
@@ -125,6 +148,7 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
                     raw_pulse_sec=None,
                     raw_distance_cm=None,
                 )
+            time.sleep(0.0002)
 
         # 2. Send 10-12 microsecond trigger pulse
         try:
@@ -141,7 +165,16 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
         t_wait_rise = time.perf_counter()
         rise_deadline = t_wait_rise + self.config.timeout_sec
 
-        while self.gpio.input(self.config.echo_pin) == LOW:
+        while True:
+            try:
+                val = self.gpio.input(self.config.echo_pin)
+            except Exception as exc:
+                logger.error("GPIO error reading ECHO pin waiting for rise: %s", exc)
+                return UltrasonicReading.create_fault(time.time())
+
+            if val == HIGH:
+                break
+
             if time.perf_counter() > rise_deadline:
                 logger.debug("Ultrasonic timeout: ECHO failed to rise HIGH.")
                 return UltrasonicReading(
@@ -156,7 +189,16 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
         fall_deadline = pulse_start + self.config.timeout_sec
 
         # 4. Wait for ECHO to fall to LOW with timeout
-        while self.gpio.input(self.config.echo_pin) == HIGH:
+        while True:
+            try:
+                val = self.gpio.input(self.config.echo_pin)
+            except Exception as exc:
+                logger.error("GPIO error reading ECHO pin waiting for fall: %s", exc)
+                return UltrasonicReading.create_fault(time.time())
+
+            if val == LOW:
+                break
+
             if time.perf_counter() > fall_deadline:
                 logger.debug("Ultrasonic timeout: ECHO failed to fall LOW.")
                 return UltrasonicReading(
@@ -170,9 +212,16 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
         pulse_end = time.perf_counter()
         pulse_duration = pulse_end - pulse_start
 
+        # Validate pulse duration strictly
+        if pulse_duration <= 0.0 or not math.isfinite(pulse_duration):
+            logger.debug("Invalid pulse duration: %s", pulse_duration)
+            return UltrasonicReading.create_fault(time.time())
+
         # 5. Acoustic flight time to distance conversion
         # Speed of sound in air ~ 343 m/s = 34300 cm/s
         raw_distance = (pulse_duration * 34300.0) / 2.0
+        if not math.isfinite(raw_distance) or raw_distance <= 0:
+            return UltrasonicReading.create_fault(time.time())
 
         # Physical noise rejection:
         # Pulses shorter than 115 us (< 2.0 cm) cannot be real acoustic reflections
@@ -328,25 +377,30 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
             if not self._is_initialized:
                 self.initialize()
             self._is_running = True
+            self._stop_event.clear()
             self._worker_thread = threading.Thread(target=self._sampling_worker, daemon=True, name="UltrasonicWorker")
             self._worker_thread.start()
             logger.info("Ultrasonic background sampling worker started (~14 Hz).")
 
     def _sampling_worker(self) -> None:
         """Continuous background sampling loop with ~70 ms cycle period (>60ms holdoff)."""
-        while self._is_running:
+        while not self._stop_event.is_set():
             try:
                 reading = self.sample_distance_cm()
                 with self._lock:
                     self._update_reading(reading)
             except Exception as exc:
                 logger.error("Exception in ultrasonic background worker: %s", exc)
-            time.sleep(0.07)  # 70 ms loop period (~14 Hz)
+            if self._stop_event.wait(timeout=0.07):
+                break
 
     def stop(self) -> None:
         """Stop background sampling thread and release GPIO pins."""
         with self._lock:
             self._is_running = False
+            self._stop_event.set()
+            self._sample_history.clear()
+            self._consecutive_faults = 0
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=0.5)
@@ -355,7 +409,8 @@ class HCSR04UltrasonicSensor(DistanceSensorInterface):
             try:
                 pins = [self.config.trig_pin, self.config.echo_pin]
                 self.gpio.cleanup(pins)
-                self._is_initialized = False
-                logger.info("Ultrasonic sensor stopped and pins released.")
             except Exception as exc:
                 logger.error("Exception during ultrasonic cleanup: %s", exc)
+            finally:
+                self._is_initialized = False
+                logger.info("Ultrasonic sensor stopped and pins released.")

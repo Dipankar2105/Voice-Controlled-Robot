@@ -74,4 +74,9 @@ if [ -z "${ROBOT_API_TOKEN:-}" ] && [ -f "${SCRIPT_DIR}/.robot_token" ]; then
 fi
 
 # 5. Launch Unified Application Server (Exec replaces shell for clean signal forwarding)
-exec "${PYTHON_BIN}" -m app.main --serve "$@"
+LAUNCH_ARGS=("$@")
+if [ "$#" -eq 0 ]; then
+    LAUNCH_ARGS=("--mode" "REAL_HARDWARE")
+fi
+
+exec "${PYTHON_BIN}" -m app.main --serve "${LAUNCH_ARGS[@]}"

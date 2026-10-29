@@ -322,3 +322,227 @@ def test_real_hardware_mode_requires_token_to_toggle_protection():
     )
     assert res.status_code == 200
     assert res.json()["enabled"] is False
+
+
+class SimulatedEchoGPIO(FakeGPIOAdapter):
+    """Accurately simulates ultrasonic echo pulses with custom rise delay and duration."""
+
+    def __init__(
+        self,
+        pulse_duration_sec: float = 0.001,
+        rise_delay_sec: float = 0.0001,
+        stuck_high_after_rise: bool = False,
+    ):
+        super().__init__()
+        self.pulse_duration_sec = pulse_duration_sec
+        self.rise_delay_sec = rise_delay_sec
+        self.stuck_high_after_rise = stuck_high_after_rise
+        self._trig_time = None
+
+    def output(self, pin: int, value: int) -> None:
+        super().output(pin, value)
+        if pin == 23 and value == HIGH:
+            self._trig_time = time.perf_counter()
+
+    def input(self, pin: int) -> int:
+        if pin == 24:
+            if self._trig_time is None:
+                return LOW
+            elapsed = time.perf_counter() - self._trig_time
+            if elapsed < self.rise_delay_sec:
+                return LOW
+            if self.stuck_high_after_rise:
+                return HIGH
+            if elapsed < (self.rise_delay_sec + self.pulse_duration_sec):
+                return HIGH
+            return LOW
+        return super().input(pin)
+
+
+def test_ultrasonic_valid_near_and_far_readings():
+    """Verify accurate measurement and classification for near (5cm) and far (250cm) physical targets."""
+    # Near: 5 cm -> pulse = 5.0 * 2 / 34300 ~ 0.0002915 s
+    pulse_near = (5.0 * 2.0) / 34300.0
+    gpio_near = SimulatedEchoGPIO(pulse_duration_sec=pulse_near, rise_delay_sec=0.00005)
+    sensor_near = HCSR04UltrasonicSensor(gpio=gpio_near, config=UltrasonicConfig(timeout_sec=0.05))
+    sensor_near.initialize()
+    r_near = sensor_near.sample_distance_cm()
+    assert r_near.is_valid
+    assert r_near.state == ObstacleState.CRITICAL
+    assert 3.5 <= r_near.distance_cm <= 6.5
+
+    # Far: 250 cm -> pulse = 250.0 * 2 / 34300 ~ 0.014577 s
+    pulse_far = (250.0 * 2.0) / 34300.0
+    gpio_far = SimulatedEchoGPIO(pulse_duration_sec=pulse_far, rise_delay_sec=0.00005)
+    sensor_far = HCSR04UltrasonicSensor(gpio=gpio_far, config=UltrasonicConfig(timeout_sec=0.05))
+    sensor_far.initialize()
+    r_far = sensor_far.sample_distance_cm()
+    assert r_far.is_valid
+    assert r_far.state == ObstacleState.CLEAR
+    assert 245.0 <= r_far.distance_cm <= 255.0
+
+
+def test_ultrasonic_no_echo_rising_edge():
+    """When ECHO line never rises (pin stays LOW), driver returns fail-closed FAULT within bounded timeout."""
+    fake_gpio = FakeGPIOAdapter()
+    fake_gpio.pin_values[24] = LOW  # Stays LOW
+    cfg = UltrasonicConfig(timeout_sec=0.01)
+    sensor = HCSR04UltrasonicSensor(gpio=fake_gpio, config=cfg)
+    sensor.initialize()
+
+    t0 = time.perf_counter()
+    reading = sensor.sample_distance_cm()
+    elapsed = time.perf_counter() - t0
+
+    assert reading.state == ObstacleState.FAULT
+    assert not reading.is_valid
+    assert not reading.allows_forward_motion
+    assert reading.distance_cm is None
+    assert elapsed < 0.05  # Bound check
+
+
+def test_ultrasonic_no_echo_falling_edge():
+    """When ECHO rises but never falls (stuck HIGH after trigger), driver returns FAULT within bounded timeout."""
+    gpio = SimulatedEchoGPIO(rise_delay_sec=0.0001, stuck_high_after_rise=True)
+    cfg = UltrasonicConfig(timeout_sec=0.01)
+    sensor = HCSR04UltrasonicSensor(gpio=gpio, config=cfg)
+    sensor.initialize()
+
+    t0 = time.perf_counter()
+    reading = sensor.sample_distance_cm()
+    elapsed = time.perf_counter() - t0
+
+    assert reading.state == ObstacleState.FAULT
+    assert not reading.is_valid
+    assert not reading.allows_forward_motion
+    assert reading.distance_cm is None
+    assert elapsed < 0.05
+
+
+def test_ultrasonic_zero_duration_and_impossible_pulse():
+    """Zero duration or unphysical pulse must fail closed as FAULT."""
+    fake_gpio = FakeGPIOAdapter()
+    sensor = HCSR04UltrasonicSensor(gpio=fake_gpio)
+    sensor.initialize()
+
+    # Direct test of classification on zero and negative pulse / distance
+    r_zero = sensor._classify_distance(0.0, 0.0, time.time())
+    assert r_zero.state == ObstacleState.FAULT
+    assert not r_zero.is_valid
+
+    r_neg = sensor._classify_distance(-15.0, -0.001, time.time())
+    assert r_neg.state == ObstacleState.FAULT
+    assert not r_neg.is_valid
+
+
+def test_ultrasonic_gpio_exceptions_handled_gracefully():
+    """Driver must catch GPIO exceptions during trigger, settle, echo wait and cleanup, returning FAULT."""
+    class FailingGPIO(FakeGPIOAdapter):
+        def __init__(self, fail_on_op: str):
+            super().__init__()
+            self.fail_on_op = fail_on_op
+
+        def output(self, pin: int, value: int) -> None:
+            if self.fail_on_op == "output":
+                raise IOError("Simulated GPIO output bus error")
+            super().output(pin, value)
+
+        def input(self, pin: int) -> int:
+            if self.fail_on_op == "input":
+                raise IOError("Simulated GPIO input line error")
+            return super().input(pin)
+
+        def cleanup(self, pins=None) -> None:
+            if self.fail_on_op == "cleanup":
+                raise IOError("Simulated GPIO cleanup error")
+            super().cleanup(pins)
+
+    # Output failure on trigger
+    sensor_out = HCSR04UltrasonicSensor(gpio=FailingGPIO("output"))
+    sensor_out.initialize()
+    assert sensor_out.sample_distance_cm().state == ObstacleState.FAULT
+
+    # Input failure on echo read
+    sensor_in = HCSR04UltrasonicSensor(gpio=FailingGPIO("input"))
+    sensor_in.initialize()
+    assert sensor_in.sample_distance_cm().state == ObstacleState.FAULT
+
+    # Cleanup exception on stop
+    sensor_clean = HCSR04UltrasonicSensor(gpio=FailingGPIO("cleanup"))
+    sensor_clean.initialize()
+    sensor_clean.stop()  # Must not raise
+    assert not sensor_clean._is_initialized
+
+
+def test_ultrasonic_initialization_failure_and_rollback():
+    """If GPIO setup fails during initialize(), sensor marks itself uninitialized and cleans up partial pins."""
+    class SetupFailingGPIO(FakeGPIOAdapter):
+        def setup(self, pin: int, mode: int, pull_up_down: int = 20, initial: int = 0) -> None:
+            if pin == 24:  # Fail on ECHO setup
+                raise RuntimeError("Simulated ECHO pin hardware reservation failure")
+            super().setup(pin, mode, pull_up_down, initial)
+
+    failing_gpio = SetupFailingGPIO()
+    sensor = HCSR04UltrasonicSensor(gpio=failing_gpio)
+
+    with pytest.raises(RuntimeError):
+        sensor.initialize()
+
+    assert not sensor._is_initialized
+
+    # Calling sample_distance_cm on a failed-init sensor returns FAULT cleanly
+    reading = sensor.sample_distance_cm()
+    assert reading.state == ObstacleState.FAULT
+    assert not reading.is_valid
+
+
+def test_ultrasonic_stop_clears_history_and_allows_reinitialization():
+    """Calling stop() clears median filter history and consecutive faults, and allows clean reinit."""
+    fake_gpio = FakeGPIOAdapter()
+    sensor = HCSR04UltrasonicSensor(gpio=fake_gpio, filter_window_size=5, min_valid_samples=2)
+    sensor.initialize()
+    sensor._is_running = True
+
+    now = time.time()
+    sensor._update_reading(UltrasonicReading(distance_cm=60.0, state=ObstacleState.CLEAR, timestamp=now))
+    assert sensor.valid_sample_count == 1
+
+    sensor.stop()
+    assert not sensor._is_running
+    assert not sensor._is_initialized
+    assert sensor.valid_sample_count == 0
+
+    # Re-initialize and verify clean state
+    sensor.initialize()
+    assert sensor._is_initialized
+    assert sensor.valid_sample_count == 0
+    sensor.stop()
+
+
+def test_navigation_behavior_when_distance_sensor_unavailable_or_faulty():
+    """RobotStateMachine must reject forward motion when distance sensor is unavailable or returning FAULT."""
+    fsm = RobotStateMachine(
+        config=load_config(),
+        motors=MockMotorController(),
+        distance_sensor=None,  # No distance sensor
+    )
+    fsm.ultrasonic_protection_enabled = True
+
+    # When sensor is None:
+    assert fsm._is_forward_path_safe() is False
+
+    # When sensor returns FAULT:
+    class FaultyDistanceSensor:
+        def get_reading(self):
+            return UltrasonicReading.create_fault()
+
+    fsm.distance_sensor = FaultyDistanceSensor()
+    assert fsm._is_forward_path_safe() is False
+
+    # When sensor throws an exception:
+    class CrashingDistanceSensor:
+        def get_reading(self):
+            raise RuntimeError("Sensor I/O timeout")
+
+    fsm.distance_sensor = CrashingDistanceSensor()
+    assert fsm._is_forward_path_safe() is False

@@ -307,3 +307,118 @@ def test_nonfinite_speed_commands_are_rejected():
         command = parser.parse(phrase)
         assert command.action == CommandAction.UNKNOWN
         assert command.is_executable is False
+
+
+def test_voice_search_intent_parsed_without_starting_mission():
+    """Parsing search commands strictly extracts intent and target without side effects."""
+    parser = CommandParser()
+    for phrase, expected_target in [
+        ("find bottle", "bottle"),
+        ("locate person", "person"),
+        ("search for chair", "chair"),
+        ("look for red target", "RED_TARGET"),
+    ]:
+        cmd = parser.parse(phrase)
+        assert cmd.intent == CommandIntent.SEARCH
+        assert cmd.action == CommandAction.SEARCH_TARGET
+        assert cmd.target_class == expected_target
+        assert cmd.is_executable is True
+        # Pure parser has zero state machine or motor side-effects
+        assert isinstance(cmd, RobotCommand)
+
+
+def test_conflicting_movement_commands_rejected():
+    """Conflicting directional commands in the same phrase must fail closed as UNKNOWN."""
+    parser = CommandParser()
+    for phrase in (
+        "forward backward",
+        "go forward move back",
+        "turn left turn right",
+        "left right",
+        "go forward and turn left",
+        "move backward and turn right",
+        "find bottle and move forward",
+        "search for chair turn left",
+    ):
+        cmd = parser.parse(phrase)
+        assert cmd.intent == CommandIntent.UNKNOWN, f"Phrase '{phrase}' unexpectedly parsed intent: {cmd.intent}"
+        assert cmd.action == CommandAction.UNKNOWN, f"Phrase '{phrase}' unexpectedly parsed action: {cmd.action}"
+        assert cmd.is_executable is False
+        assert cmd.causes_movement is False
+
+
+def test_safety_stop_preempts_conflicting_movement_words():
+    """Emergency stop and stop commands must take immediate precedence even if movement words are present."""
+    parser = CommandParser()
+    # General stop overrides movement words
+    cmd1 = parser.parse("forward stop")
+    assert cmd1.intent == CommandIntent.SAFETY
+    assert cmd1.action == CommandAction.STOP
+    assert cmd1.causes_movement is False
+
+    cmd2 = parser.parse("stop forward")
+    assert cmd2.intent == CommandIntent.SAFETY
+    assert cmd2.action == CommandAction.STOP
+
+    # Emergency stop overrides movement words
+    cmd3 = parser.parse("emergency stop move forward")
+    assert cmd3.intent == CommandIntent.SAFETY
+    assert cmd3.action == CommandAction.EMERGENCY_STOP
+
+    cmd4 = parser.parse("go back and halt")
+    assert cmd4.intent == CommandIntent.SAFETY
+    assert cmd4.action == CommandAction.STOP
+
+
+def test_repeated_consistent_commands_supported():
+    """Repeated single-action phrases parse safely without conflict."""
+    parser = CommandParser()
+    assert parser.parse("stop stop").action == CommandAction.STOP
+    assert parser.parse("forward forward").action == CommandAction.MOVE_FORWARD
+    assert parser.parse("left left").action == CommandAction.TURN_LEFT
+    assert parser.parse("right right").action == CommandAction.TURN_RIGHT
+
+
+def test_duplicate_transcript_suppression_in_runtime():
+    """Runtime suppresses duplicate non-safety transcripts in debounce window, but never stops."""
+    from app.runtime import RobotRuntime
+    from app.hardware.mock_hardware import (
+        MockMotorController,
+        MockDistanceSensor,
+        MockCamera,
+        MockAudioSource,
+        MockSpeechRecognizer,
+        MockDetector,
+    )
+
+    runtime = RobotRuntime(
+        motor_controller=MockMotorController(),
+        distance_sensor=MockDistanceSensor(),
+        camera=MockCamera(),
+        audio_source=MockAudioSource(),
+        speech_recognizer=MockSpeechRecognizer(),
+        detector=MockDetector(),
+    )
+    runtime.start()
+    try:
+        # 1. First forward command accepted
+        ok1, cmd1, _ = runtime.dispatch_text_command("forward")
+        assert ok1 is True
+        assert cmd1.action == CommandAction.MOVE_FORWARD
+
+        # 2. Immediate duplicate forward command suppressed within debounce window
+        ok2, cmd2, msg2 = runtime.dispatch_text_command("forward")
+        assert ok2 is False
+        assert "Duplicate transcript suppressed" in msg2
+
+        # 3. Stop command immediately after is NEVER suppressed
+        ok3, cmd3, _ = runtime.dispatch_text_command("stop")
+        assert ok3 is True
+        assert cmd3.action == CommandAction.STOP
+
+        # 4. Repeated stop is NEVER suppressed (safety-critical)
+        ok4, cmd4, _ = runtime.dispatch_text_command("stop")
+        assert ok4 is True
+        assert cmd4.action == CommandAction.STOP
+    finally:
+        runtime.stop()

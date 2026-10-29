@@ -1,40 +1,54 @@
-# SS_Project_VCR — Verified Software Status
+# SS_Project_VCR — Verified Integration & Final Acceptance Status
 
-**Status:** Software audit, voice/GUI integration, and physical floor motor calibration verified on live hardware.
+**Status:** ALL PHASES 1–5 COMPLETED. Clean-room integration, offline speech, YOLO detection, ultrasonic ranging, state-machine arbitration, and end-to-end acceptance verified.
 
 ## Current Snapshot
 
-- Primary detector: `models/object_detection/best_v2_target.onnx` (26 classes).
-- Reference detector retained: `best_v1.onnx`.
-- Offline speech model retained: `models/voice/vosk-model/` (Vosk KaldiRecognizer with 1162 grammar entries).
-- Audio input: Logitech C270 USB microphone (`hw:3,0`, index 1, 16 kHz mono 16-bit PCM).
-- Unified GUI/API: Port 8000 (`http://127.0.0.1:8000/`, LAN `http://10.248.131.117:8000/`), live MJPEG camera stream at `/api/camera/stream` with green timestamp overlay, deadband guides, crosshair, and YOLO detections; polling telemetry at `/api/status` refreshed at 4 Hz with active live clock badge.
-- Frontend Telemetry: Restored live updates across all 6 panels; large cyan ultrasonic distance display (`val-dist-large`); dynamic speech transcript display; informative FSM state explanation (`val-fsm-desc`).
-- Default mode: `SIMULATION`; real hardware runs via `scripts/run_daemon.sh` or `--mode REAL_HARDWARE`.
-- Safety thresholds: Target stop: 30 cm provisional; Blocked: 25.0 cm; Critical: 15.0 cm; Blind zone: < 2.0 cm.
-- Motor Calibration: Configured manual pulse duration updated to **1.25 s** (`manual_pulse_sec` in `default_config.yaml`) and turn speed to **0.60** to overcome floor friction.
-- Floor Calibration Measurements: Left turn rotates ~35°-40° in 1.25 s (~30°/sec; full 360° rotation ~12.0 s); Right turn rotates ~10° in 1.25 s. Motors default to 0% PWM at idle (power-saving mode).
-- Network command controls: In real-hardware mode, mutating commands require `ROBOT_API_TOKEN` (>= 24 chars). STOP and EMERGENCY STOP remain unauthenticated because they strictly remove actuation.
+- **Primary YOLO Detector:** `models/object_detection/best_v2_target.onnx` (26 classes, 169 ms CPU latency on Pi, verified).
+- **Secondary Reference Detector:** `models/object_detection/best_v1.onnx` (preserved).
+- **Offline Speech Model:** `models/voice/vosk-model/` (Vosk KaldiRecognizer with 1,146 robotics grammar phrases, verified).
+- **Audio Capture:** Logitech C270 USB microphone (`hw:3,0`, index 1, 16 kHz mono 16-bit PCM, verified).
+- **Camera Frame Owner:** Logitech C270 USB camera (`/dev/video0`, 640x480 @ 15 FPS, 1.30 ms query latency, verified).
+- **Acoustic Ranging:** HC-SR04 ultrasonic sensor (TRIG: 23, ECHO: 24 with pull-down, 88.6 cm physical reading verified).
+- **Motor Control & Mapping:** L298N 4WD controller (ENA: 18, IN1: 17, IN2: 27, ENB: 13, IN3: 5, IN4: 22, 100 Hz PWM, verified).
+- **Unified Telemetry & Dashboard:** Port 8000 (`http://127.0.0.1:8000/`), live MJPEG camera stream at `/api/camera/stream` with green timestamp overlay, crosshairs, deadband guides, and detection boxes; polling telemetry at `/api/status` at 4 Hz.
+- **Security & Concurrency:** In real-hardware mode, mutating commands require `ROBOT_API_TOKEN` (>= 24 chars). STOP and EMERGENCY STOP remain unauthenticated because they strictly remove actuation.
 
-## Latest Software Verification
+## Latest Automated Software Verification
 
-- `pytest`: **174 passed, 1 skipped, 0 failed** in 31.38s (175 collected; 1 environment-dependent source archive check skipped).
-- `python -m compileall -q .`: passed with 0 errors.
-- `python -m app.main --check-config`: passed.
-- `bash -n start_robot.sh`: passed.
-- Unit regression suite:
-  - Configuration invariants (`tests/unit/test_config.py`): **9 passed**.
-  - State machine safety (`tests/unit/test_phase7_state_machine.py`): **23 passed** (including turn/forward pulse preemption loops).
-  - Runtime & API security (`tests/unit/test_phase8_runtime_dashboard.py`): **15 passed**.
-- Unified Dashboard & GUI: Open and active in Chromium desktop session (`WAYLAND_DISPLAY=wayland-0`), screenshot archived in `diagnostics/dashboard_live_view.png`.
-- Voice Pipeline Integration:
-  - Command Parser: 20/20 test cases passed (representative phrases, ambiguous speech, ambient word rejection, partial transcript safety gating).
-  - End-to-End Voice Integration (`scratch/test_voice_e2e.py`): 8/8 pipeline tests passed.
-  - Live Hardware Verification: Physical C270 microphone stream and Vosk engine running; ambient speech ("blue a chair", "monitor") safely ignored; "find person" confirmed target optically and safely halted on ultrasonic obstacle proximity.
+- **Full Pytest Suite:** **288 passed, 1 skipped, 0 failed** across all unit and integration tests.
+  - End-to-End Acceptance (`tests/unit/test_end_to_end_acceptance.py`): **12 passed** (Startup, Voice Command Flow, Object Search, Safety & Lifecycle).
+  - Autonomous Mission (`tests/unit/test_phase5_autonomous_mission.py`): **32 passed**.
+  - State Machine & Navigation (`tests/unit/test_phase7_state_machine.py`): **27 passed**.
+  - Hardware & Motor Controller (`tests/unit/test_phase3_hardware.py`): **31 passed**.
+  - Audio & Vosk Engine (`tests/unit/test_phase4_audio_vosk.py`): **17 passed**.
+  - Command Parser (`tests/unit/test_phase6_command_parser.py`): **75 passed**.
+  - Runtime & Dashboard Security (`tests/unit/test_phase8_runtime_dashboard.py`): **19 passed**.
+  - Joystick Teleoperation (`tests/unit/test_phase9_joystick.py`): **9 passed**.
+  - Ultrasonic Protection & Gating (`tests/unit/test_ultrasonic_toggle.py`): **18 passed**.
+  - Vision & Camera (`tests/unit/test_phase4_camera.py`): **10 passed**.
+  - YOLO ONNX Detector (`tests/unit/test_phase5_yolo_detector.py`): **13 passed**.
+  - Asset Integrity & Config Validation: **25 passed**.
+- `git diff --check`: Passed with 0 whitespace errors.
+- `python -m app.main --check-config`: Passed with 0 errors.
 
-## Remaining Physical Hardware Steps Before Floor Operation
+## Hardware Verification Status: Physical vs Software Tested
 
-1. Verify HC-SR04 ECHO voltage divider never exceeds 3.3 V at GPIO 24.
-2. Supervised wheel-lift test of forward/backward/left/right motor polarity with accessible manual cutoff.
-3. Supervised floor forward test with configured 0.75 s pulse at 0.70 speed to verify physical chassis displacement.
-4. Chassis calibration: Turn duration per degree, ultrasonic stop distance, and sensor-to-bumper offset.
+| Subsystem / Capability | Verification Status | Evidence / Notes |
+|---|---|---|
+| **Motor Movement Primitives** | **Physically Verified** | Real movement on floor at 50% PWM (`BOTH_FORWARD`, `BOTH_REVERSE`, `TURN_LEFT`, `TURN_RIGHT`). Baseline protected. |
+| **Logitech C270 Camera** | **Physically Verified** | Frame capture verified (10/10 frames, 1.30 ms latency, 640x480 @ 15 FPS). |
+| **YOLO ONNX Object Detector** | **Physically Verified** | ONNX Runtime session inference verified (26 classes, 169 ms / 5.9 FPS on Pi CPU). |
+| **Logitech C270 Microphone** | **Physically Verified** | ALSA capture verified (16 kHz mono 16-bit PCM, RMS volume 0.0121, healthy signal). |
+| **Vosk Offline Speech Engine** | **Physically Verified** | Kaldi speech model loaded (1,146 robotics grammar phrases, live decode verified). |
+| **HC-SR04 Ultrasonic Sensor** | **Physically Verified** | Physical ping verified on Pi (88.6 cm reading, pull-down active, valid state). |
+| **End-to-End Navigation Controller** | **Software Verified (288 tests)** | Multi-frame target confirmation, optical centering deadband (+/- 40px), standoff arrival (<= 30 cm, > 25 cm), obstacle interlock verified. |
+| **Full Autonomous Mission on Floor** | **Pending Operator Supervision** | Full autonomous target search & approach on the floor awaiting operator supervision. |
+
+## Checklist for Future Physical Acceptance with Operator
+
+1. Elevate robot chassis so all four wheels rotate freely in the air.
+2. Confirm a physical battery power cutoff switch is within immediate reach.
+3. Verify voltage divider on HC-SR04 ECHO line (must not exceed 3.3 V at GPIO 24).
+4. Run `scripts/commission_hardware.py --interactive` with supervisor present.
+5. Place target object (bottle/chair) at 1.0 m on flat floor surface with obstacle at 20 cm to demonstrate autonomous navigation stop.

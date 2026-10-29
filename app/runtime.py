@@ -131,6 +131,7 @@ class RobotRuntime:
         self._latest_detections: list = []
         self._latest_detections_time: float = 0.0
         self._last_raw_transcript: str = ""
+        self._last_command_time: float = 0.0
         self._current_partial_transcript: str = ""
         self._last_parsed_command: Optional[RobotCommand] = None
         self.ultrasonic_protection_enabled: bool = True
@@ -471,10 +472,24 @@ class RobotRuntime:
                 RobotState.CENTERING,
                 RobotState.APPROACHING,
             ):
-                try:
-                    self.fsm.step_mission()
-                except Exception as exc:
-                    logger.error("Error stepping mission: %s", exc)
+                if not self._joystick_active and not self._is_executing_command:
+                    with self._command_lock:
+                        if (
+                            not self._joystick_active
+                            and not self._is_executing_command
+                            and not self._stop_event.is_set()
+                            and self.fsm
+                            and self.fsm.state in (
+                                RobotState.SEARCHING,
+                                RobotState.TARGET_CONFIRMED,
+                                RobotState.CENTERING,
+                                RobotState.APPROACHING,
+                            )
+                        ):
+                            try:
+                                self.fsm.step_mission()
+                            except Exception as exc:
+                                logger.error("Error stepping mission: %s", exc)
             time.sleep(0.05)  # 20 Hz tick
 
     def _speech_worker(self) -> None:
@@ -507,6 +522,22 @@ class RobotRuntime:
                         partial = self.speech_recognizer.get_partial_result()
                         if partial and partial.strip():
                             self._current_partial_transcript = partial.strip()
+                            # Immediate safety stop preemption from partial transcript
+                            if self.command_parser:
+                                partial_cmd = self.command_parser.parse(partial, is_partial=True)
+                                if partial_cmd.action in (
+                                    CommandAction.EMERGENCY_STOP,
+                                    CommandAction.STOP,
+                                    CommandAction.CANCEL_SEARCH,
+                                    CommandAction.STOP_SCANNING,
+                                ):
+                                    logger.warning("Immediate safety preemption from partial transcript: '%s'", partial)
+                                    self.dispatch_text_command(partial, is_partial=True)
+                                    if hasattr(self.speech_recognizer, "reset"):
+                                        try:
+                                            self.speech_recognizer.reset()
+                                        except Exception:
+                                            pass
             except Exception as exc:
                 logger.error("Error in speech worker: %s", exc)
                 time.sleep(0.05)
@@ -553,7 +584,9 @@ class RobotRuntime:
 
             time.sleep(target_sleep)
 
-    def dispatch_text_command(self, raw_text: str) -> Tuple[bool, Optional[RobotCommand], str]:
+    def dispatch_text_command(
+        self, raw_text: str, is_partial: bool = False
+    ) -> Tuple[bool, Optional[RobotCommand], str]:
         """Parse and execute a text command through the authoritative state machine.
         
         Enforces concurrency rejection: if a non-emergency command is already executing,
@@ -563,22 +596,73 @@ class RobotRuntime:
         if not self.command_parser:
             return False, None, "Command parser not initialized"
 
-        cmd = self.command_parser.parse(raw_text)
+        cmd = self.command_parser.parse(raw_text, is_partial=is_partial)
+        now = time.time()
+
+        # Emergency Stop, Stop, and Cancel override EVERYTHING immediately
+        if cmd.action in (
+            CommandAction.EMERGENCY_STOP,
+            CommandAction.STOP,
+            CommandAction.CANCEL_SEARCH,
+            CommandAction.STOP_SCANNING,
+        ):
+            self._joystick_active = False
+            self._last_raw_transcript = raw_text
+            self._last_command_time = now
+            self._current_partial_transcript = ""
+            self._last_parsed_command = cmd
+
+            # Flush recognizer buffer on stop
+            if self.speech_recognizer and hasattr(self.speech_recognizer, "reset"):
+                try:
+                    self.speech_recognizer.reset()
+                except Exception:
+                    pass
+
+            if self.fsm:
+                success = self.fsm.handle_command(cmd)
+                return success, cmd, "Emergency/Stop/Cancel command executed"
+            return False, cmd, "State machine not initialized"
+
+        # Duplicate transcript suppression for non-safety commands:
+        # Avoid rapidly re-executing identical non-safety commands within debounce window (1.50s)
+        last_time = getattr(self, "_last_command_time", 0.0)
+        last_tx = getattr(self, "_last_raw_transcript", "")
+        if (
+            cmd.intent not in (CommandIntent.SAFETY, CommandIntent.CONTROL)
+            and raw_text == last_tx
+            and (now - last_time) < 1.50
+        ):
+            logger.info("Suppressing duplicate transcript event within debounce window: '%s'", raw_text)
+            return False, cmd, "Duplicate transcript suppressed"
+
         self._last_raw_transcript = raw_text
         self._current_partial_transcript = ""
         self._last_parsed_command = cmd
 
-        # Emergency Stop and Stop override EVERYTHING immediately
-        if cmd.action in (CommandAction.EMERGENCY_STOP, CommandAction.STOP):
-            if self.fsm:
-                success = self.fsm.handle_command(cmd)
-                return success, cmd, "Emergency/Stop command executed"
-            return False, cmd, "State machine not initialized"
-
-        # Concurrency protection for non-emergency commands
+        # Concurrency protection for non-emergency commands:
+        # Cannot execute if another text command is running OR if joystick teleoperation is actively held.
         if self._is_executing_command:
             logger.warning("Rejecting command '%s': another command is currently executing.", raw_text)
             return False, cmd, "Concurrent command rejected: another command is currently executing"
+
+        if self._joystick_active:
+            logger.warning("Rejecting command '%s': joystick teleoperation is currently active.", raw_text)
+            return False, cmd, "Concurrent command rejected: joystick is currently active"
+
+        # Autonomous Search Command: cleanly cancel and replace any active mission
+        if cmd.intent == CommandIntent.SEARCH and cmd.action == CommandAction.SEARCH_TARGET and cmd.target_class:
+            can_search = True
+            if self.detector and hasattr(self.detector, "has_class"):
+                can_search = self.detector.has_class(cmd.target_class)
+            if can_search and self.fsm and self.fsm.state in (
+                RobotState.SEARCHING,
+                RobotState.TARGET_CONFIRMED,
+                RobotState.CENTERING,
+                RobotState.APPROACHING,
+            ):
+                logger.info("Replacing active search mission with new search for '%s'", cmd.target_class)
+                self.fsm.cancel_mission(f"Replacing active mission with search for '{cmd.target_class}'")
 
         with self._command_lock:
             if not cmd.is_executable:
@@ -595,6 +679,7 @@ class RobotRuntime:
                 return success, cmd, status_msg
             finally:
                 self._is_executing_command = False
+                self._last_command_time = time.time()
 
     def dispatch_joystick(
         self, action: str, speed: Optional[float] = None
@@ -628,6 +713,10 @@ class RobotRuntime:
 
         if self.fsm and self.fsm.is_emergency_stop_latched:
             return False, "Emergency stop is latched: actuation refused"
+
+        # Concurrency protection: reject joystick movement if a voice or API command is executing
+        if self._is_executing_command:
+            return False, "Concurrent command rejected: another command is currently executing"
 
         # Interrupt any ongoing autonomous mission
         if self.fsm and self.fsm.state in (

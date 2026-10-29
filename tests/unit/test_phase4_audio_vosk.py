@@ -242,3 +242,83 @@ def test_audio_source_single_initialization_and_idempotency():
         source.close()
         assert source._is_closed is True
 
+
+def test_microphone_stream_open_failure_cleanup():
+    """Stream initialization error must clean up partial stream and mark source not streaming."""
+    pytest.importorskip("sounddevice", reason="sounddevice is not installed in this test environment")
+
+    with patch("sounddevice.InputStream", side_effect=IOError("Device busy or unavailable")), \
+         patch("sounddevice.query_devices", return_value=[{"name": "Logitech C270", "max_input_channels": 1}]):
+        source = MicrophoneAudioSource()
+        with pytest.raises(IOError, match="Device busy"):
+            source.start_stream()
+
+        assert source._is_streaming is False
+        assert source._stream is None
+
+
+def test_microphone_stream_closed_cannot_restart():
+    """Calling start_stream on a closed MicrophoneAudioSource must raise RuntimeError."""
+    source = MicrophoneAudioSource()
+    source.close()
+    assert source._is_closed is True
+
+    with pytest.raises(RuntimeError, match="Cannot start audio stream on a closed"):
+        source.start_stream()
+
+
+def test_convert_and_resample_pcm_empty_and_nan_handling():
+    """Empty or non-finite inputs must not raise and must return safe PCM bytes."""
+    # Empty array
+    assert convert_and_resample_pcm(np.array([], dtype=np.float32), 16000) == b""
+
+    # Array containing NaNs and Infs
+    corrupt = np.array([float("nan"), float("inf"), float("-inf"), 0.5], dtype=np.float32)
+    pcm_bytes = convert_and_resample_pcm(corrupt, 16000, 16000)
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    assert len(samples) == 4
+    assert samples[0] == 0  # nan -> 0
+    assert samples[1] == 32767  # +inf -> 1.0 -> 32767
+    assert samples[2] == -32767  # -inf -> -1.0 -> -32767
+    assert abs(samples[3] - 16383) < 10
+
+
+def test_vosk_accept_waveform_malformed_and_odd_bytes():
+    """Recognizer safely handles empty and odd-byte PCM chunks without Kaldi crashes."""
+    recognizer = VoskSpeechRecognizer()
+    recognizer._recognizer = MagicMock()
+    recognizer._recognizer.AcceptWaveform.return_value = False
+    recognizer._recognizer.PartialResult.return_value = '{"partial": ""}'
+
+    # Empty bytes -> False
+    assert recognizer.accept_waveform(b"") is False
+
+    # Odd length bytes (3 bytes) -> truncated to 2 bytes and fed
+    assert recognizer.accept_waveform(b"\x00\x01\x02") is False
+    # Verify AcceptWaveform was called with 2 bytes
+    recognizer._recognizer.AcceptWaveform.assert_called_with(b"\x00\x01")
+
+
+def test_vosk_accept_waveform_exception_handling():
+    """Exceptions in Kaldi AcceptWaveform are caught and return False safely."""
+    recognizer = VoskSpeechRecognizer()
+    recognizer._recognizer = MagicMock()
+    recognizer._recognizer.AcceptWaveform.side_effect = RuntimeError("Kaldi internal decode error")
+
+    assert recognizer.accept_waveform(b"\x00\x00" * 100) is False
+
+
+def test_vosk_recognizer_close_and_resource_cleanup():
+    """close() resets Kaldi recognizer and releases model references."""
+    recognizer = VoskSpeechRecognizer()
+    recognizer._recognizer = MagicMock()
+    recognizer._model = MagicMock()
+    recognizer._vosk = MagicMock()
+
+    recognizer.close()
+    assert recognizer._recognizer is None
+    assert recognizer._model is None
+    assert recognizer._vosk is None
+    assert recognizer.get_result() == ""
+    assert recognizer.get_partial_result() == ""
+

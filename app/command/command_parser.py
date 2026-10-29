@@ -230,17 +230,7 @@ class CommandParser:
         # -------------------------------------------------------------------
         # 1. Safety & Emergency Stop Commands (Highest Priority)
         # -------------------------------------------------------------------
-        if norm in ("emergency stop", "e stop", "estop"):
-            return RobotCommand(
-                raw_transcript=raw,
-                normalized_text=norm,
-                intent=CommandIntent.SAFETY,
-                action=CommandAction.EMERGENCY_STOP,
-                is_partial=is_partial,
-                confidence=confidence,
-                timestamp=ts,
-            )
-
+        # Specific control stops first
         if norm == "stop scanning":
             return RobotCommand(
                 raw_transcript=raw,
@@ -263,7 +253,20 @@ class CommandParser:
                 timestamp=ts,
             )
 
-        if norm in ("stop", "halt", "freeze", "stop robot", "wait"):
+        # Emergency stop takes precedence if present anywhere in the utterance
+        if norm in ("emergency stop", "e stop", "estop") or "emergency stop" in norm or "e stop" in norm or "estop" in tokens:
+            return RobotCommand(
+                raw_transcript=raw,
+                normalized_text=norm,
+                intent=CommandIntent.SAFETY,
+                action=CommandAction.EMERGENCY_STOP,
+                is_partial=is_partial,
+                confidence=confidence,
+                timestamp=ts,
+            )
+
+        # General stop commands take safety precedence over any movement
+        if norm in ("stop", "halt", "freeze", "stop robot", "wait") or any(t in ("stop", "halt", "freeze", "wait") for t in tokens):
             return RobotCommand(
                 raw_transcript=raw,
                 normalized_text=norm,
@@ -398,6 +401,18 @@ class CommandParser:
                 error_reason=f"Unrecognized speed command format: '{norm}'",
             )
 
+        # Check for directional movement conflict flags
+        fwd_words = {"forward", "straight"}
+        bwd_words = {"backward", "back", "reverse", "backwards", "backwad"}
+        left_words = {"left"}
+        right_words = {"right"}
+
+        has_fwd = any(t in fwd_words for t in tokens)
+        has_bwd = any(t in bwd_words for t in tokens)
+        has_left = any(t in left_words for t in tokens)
+        has_right = any(t in right_words for t in tokens)
+        active_directions = sum([has_fwd, has_bwd, has_left, has_right])
+
         # -------------------------------------------------------------------
         # 4. Search Commands ("find", "locate", "search for", "look for")
         # -------------------------------------------------------------------
@@ -418,6 +433,19 @@ class CommandParser:
                 break
 
         if is_search:
+            # Conflicting search and movement commands in the same utterance
+            if active_directions > 0:
+                return RobotCommand(
+                    raw_transcript=raw,
+                    normalized_text=norm,
+                    intent=CommandIntent.UNKNOWN,
+                    action=CommandAction.UNKNOWN,
+                    is_partial=is_partial,
+                    confidence=confidence,
+                    timestamp=ts,
+                    error_reason="Conflicting search and movement commands in transcript",
+                )
+
             # Strip articles: "the", "a", "an"
             for art in ("the ", "a ", "an "):
                 if target_str.startswith(art):
@@ -497,17 +525,34 @@ class CommandParser:
                 )
 
         # -------------------------------------------------------------------
-        # 5. Directional Movement Commands (Complete Token Match)
+        # 5. Directional Movement Commands (Complete Token Match & Conflict Check)
         # -------------------------------------------------------------------
+        # Detect conflicting movements in the same transcript
+        if active_directions > 1:
+            return RobotCommand(
+                raw_transcript=raw,
+                normalized_text=norm,
+                intent=CommandIntent.UNKNOWN,
+                action=CommandAction.UNKNOWN,
+                is_partial=is_partial,
+                confidence=confidence,
+                timestamp=ts,
+                error_reason="Conflicting movement commands in transcript",
+            )
+
         movement_action: Optional[CommandAction] = None
 
-        if norm in ("forward", "move forward", "go forward", "straight"):
+        if norm in ("forward", "move forward", "go forward", "straight", "forward forward", "go forward go forward"):
             movement_action = CommandAction.MOVE_FORWARD
-        elif norm in ("backward", "move backward", "go backward", "back", "go back", "reverse"):
+        elif norm in (
+            "backward", "move backward", "go backward", "back", "go back", "reverse",
+            "backward backward", "back back", "backwards", "move backwards", "go backwards",
+            "backwad", "move backwad", "go backwad", "move back"
+        ):
             movement_action = CommandAction.MOVE_BACKWARD
-        elif norm in ("turn left", "left", "rotate left"):
+        elif norm in ("turn left", "left", "rotate left", "turn left turn left", "left left"):
             movement_action = CommandAction.TURN_LEFT
-        elif norm in ("turn right", "right", "rotate right"):
+        elif norm in ("turn right", "right", "rotate right", "turn right turn right", "right right"):
             movement_action = CommandAction.TURN_RIGHT
 
         if movement_action is not None:

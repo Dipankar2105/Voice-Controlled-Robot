@@ -230,3 +230,27 @@ def test_real_hardware_mode_requires_token_for_joystick():
         json={"action": "forward"},
     )
     assert res.status_code == 200
+
+
+def test_conflicting_voice_and_joystick_commands(test_runtime: RobotRuntime):
+    """Ensure conflicting voice and joystick commands cannot simultaneously control motors."""
+    # 1. Active joystick blocks incoming voice movement
+    test_runtime.dispatch_joystick("forward", 0.50)
+    assert test_runtime._joystick_active is True
+
+    success, cmd, msg = test_runtime.dispatch_text_command("move backward")
+    assert not success
+    assert "joystick is currently active" in msg
+
+    # 2. Stop command via voice overrides and clears active joystick
+    stop_ok, stop_cmd, stop_msg = test_runtime.dispatch_text_command("stop")
+    assert stop_ok
+    assert test_runtime._joystick_active is False
+    assert test_runtime.motors.current_speeds == (0.0, 0.0)
+
+    # 3. Executing voice command blocks joystick movement
+    test_runtime._is_executing_command = True
+    joy_ok, joy_msg = test_runtime.dispatch_joystick("forward", 0.50)
+    assert not joy_ok
+    assert "Concurrent command rejected" in joy_msg
+    test_runtime._is_executing_command = False

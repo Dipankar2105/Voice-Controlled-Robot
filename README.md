@@ -185,23 +185,63 @@ In real-hardware mode, the dashboard prompts for `ROBOT_API_TOKEN`. It is never 
 
 ---
 
-## 6. Hardware Commissioning & Acceptance Testing
+## 6. Software Testing & Safe Diagnostics
 
-Before running the robot on the floor, execute the interactive acceptance suite:
+### A. Full Automated Test Suite (Unit & End-to-End Acceptance)
+Run all 288 automated tests covering configuration, state machine, camera, detector, Vosk speech, command parsing, ultrasonic sensing, and end-to-end mission workflows:
 ```bash
-# Elevate chassis so wheels rotate in the air!
-python scripts/run_acceptance_tests.py --all
+.venv/bin/pytest tests/unit/
 ```
-See detailed step-by-step procedures in [docs/HARDWARE_ACCEPTANCE_GUIDE.md](file:///c:/Users/Dipankar%20Pimple/Downloads/SS_VCR_FINAL_CLEAN/SS_Project_VCR_FRESH/docs/HARDWARE_ACCEPTANCE_GUIDE.md).
+
+### B. Safe Non-Actuating Hardware Diagnostics
+These utilities inspect real physical peripherals without running motors or moving the robot:
+```bash
+# 1. Static Configuration & Cryptographic Model Asset Validation
+.venv/bin/python -m app.main --check-config
+
+# 2. Camera Frame Capture, Freshness & Optical Latency (Logitech C270)
+.venv/bin/python scripts/diagnose_camera.py --device 0
+
+# 3. Offline YOLO ONNX Model & Inference Benchmark (Zero Motor Actuation)
+.venv/bin/python scripts/diagnose_detector.py --model v2
+
+# 4. USB Microphone Capture & Vosk Kaldi Speech Decoding (Logitech C270)
+.venv/bin/python scripts/diagnose_microphone.py --seconds 2.0
+
+# 5. Live Ultrasonic Ranging Distance Check (Pins 23/24, Zero Motor Actuation)
+.venv/bin/python scripts/live_ultrasonic.py
+```
+
+### C. Supervised Interactive Commissioning (Elevated Wheels Only)
+When physical hardware validation is required, all four wheels MUST be elevated in the air:
+```bash
+.venv/bin/python scripts/commission_hardware.py --interactive
+```
+See detailed step-by-step procedures in [docs/HARDWARE_ACCEPTANCE_GUIDE.md](docs/HARDWARE_ACCEPTANCE_GUIDE.md).
 
 ---
 
-## 7. Troubleshooting & Fault Codes
+## 7. Verification Matrix: Physical vs Software Tested
+
+| Subsystem / Capability | Verification Status | Evidence / Notes |
+|---|---|---|
+| **Motor Primitives** (`FORWARD`, `REVERSE`, `TURN_LEFT`, `TURN_RIGHT`) | **Physically Verified** | Verified on live hardware on the floor at 50% PWM. Interface & pins frozen. |
+| **Logitech C270 Camera** | **Physically Verified** | Real frame capture verified (10/10 frames, 1.30 ms latency, 640x480 @ 15 FPS). |
+| **YOLO ONNX Object Detector** | **Physically Verified** | Real ONNX session inference verified (26 classes, 169 ms / 5.9 FPS on Pi CPU). |
+| **Logitech C270 Microphone** | **Physically Verified** | Real ALSA stream captured (16 kHz mono 16-bit PCM, RMS signal verified). |
+| **Vosk Offline Speech Engine** | **Physically Verified** | Real Kaldi model loaded (1,146 robotics grammar phrases, live decode verified). |
+| **HC-SR04 Ultrasonic Distance** | **Physically Verified** | Real sensor ping verified on Pi (88.6 cm reading, pull-down active, valid state). |
+| **End-to-End Navigation & FSM** | **Software Verified (288 tests)** | State transitions, deadband centering, standoff arrival, obstacle aborts verified. |
+| **Floor Autonomous Mission** | **Pending Operator Supervision** | Real target approach on floor with elevated pre-check awaiting user approval. |
+
+---
+
+## 8. Troubleshooting & Fault Codes
 
 | Fault Code | Cause | Recommended Remediation |
 |---|---|---|
 | `FAULT_CONFIG_INVALID` | Duplicate GPIO assignment, invalid speed bound, or non-monotonic threshold | Check `config/default_config.yaml` against pinout table |
-| `FAULT_ASSET_MISSING` | Preserved ONNX model file or Vosk directory missing | Run `python -m pytest tests/unit/test_asset_integrity.py` |
+| `FAULT_ASSET_MISSING` | Preserved ONNX model file or Vosk directory missing | Run `.venv/bin/pytest tests/unit/test_asset_integrity.py` |
 | `FAULT_HARDWARE_INIT_FAILED` | GPIO pin setup failed or `REAL_HARDWARE` mode requested on non-Pi | Verify running on Raspberry Pi ARM Linux or set `mode: SIMULATION` |
 | `FAULT_SENSOR_TIMEOUT` | HC-SR04 sensor unresponsive or wiring disconnected | Check TRIG/ECHO wiring, 5V power supply, and ground connection |
 | `FAULT_CAMERA_FRAME_DROP` | Camera disconnected or USB bandwidth saturated | Reconnect Logitech C270 to USB 3.0 (blue port); run `diagnose_camera.py` |
@@ -209,7 +249,7 @@ See detailed step-by-step procedures in [docs/HARDWARE_ACCEPTANCE_GUIDE.md](file
 
 ---
 
-## 8. Graceful Shutdown
+## 9. Graceful Shutdown
 
 To shut down cleanly:
 1. Press `Ctrl+C` in the terminal running `./start_robot.sh`.

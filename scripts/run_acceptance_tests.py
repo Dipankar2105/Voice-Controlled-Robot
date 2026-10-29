@@ -170,12 +170,13 @@ def test_motors_raised_chassis():
     print("  TEST 4: MOTOR DIRECTION & PWM (CHASSIS ELEVATED)")
     print("=" * 60)
     print("MANDATORY SAFETY: All four wheels MUST be elevated and spinning freely in the air.")
-    print("BCM Pin Map: Left ENA=18, IN1=17, IN2=27 | Right ENB=13, IN3=22, IN4=5")
+    cfg = load_config()
+    print(f"BCM Pin Map: Left ENA={cfg.motor.left_ena_pin}, IN1={cfg.motor.left_in1_pin}, IN2={cfg.motor.left_in2_pin} | "
+          f"Right ENB={cfg.motor.right_enb_pin}, IN3={cfg.motor.right_in3_pin}, IN4={cfg.motor.right_in4_pin}")
     if not prompt_confirm("Are all wheels elevated off the ground and power cutoff switch in hand?"):
         print("[ABORT] Test cancelled for safety.")
         return False
 
-    cfg = load_config()
     gpio = RPiGPIOAdapter() if sys.platform.startswith("linux") else FakeGPIOAdapter()
     motors = L298NMotorController(gpio=gpio, config=cfg.motor)
     motors.initialize()

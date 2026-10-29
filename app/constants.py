@@ -19,8 +19,8 @@ PIN_LEFT_IN2: int = 27    # Direction Bit 2    (Physical Pin 13)
 
 # Right Motors (L298N Dual H-Bridge Channel B)
 PIN_RIGHT_ENB: int = 13   # PWM Speed Control (Physical Pin 33)
-PIN_RIGHT_IN3: int = 22   # Direction Bit 3    (Physical Pin 15)
-PIN_RIGHT_IN4: int = 5    # Direction Bit 4    (Physical Pin 29)
+PIN_RIGHT_IN3: int = 5    # Direction Bit 3    (Physical Pin 29) — Inverted (5/22) for mirrored 4WD chassis polarity
+PIN_RIGHT_IN4: int = 22   # Direction Bit 4    (Physical Pin 15) — Inverted (5/22) for mirrored 4WD chassis polarity
 
 # Forward Ultrasonic Sensor (HC-SR04)
 PIN_ULTRASONIC_TRIG: int = 23  # Pi Output Trigger (Physical Pin 16)
@@ -52,15 +52,20 @@ MIN_SPEED: float = 0.10           # Minimum effective motor stall threshold
 
 # Motion Timing Bounds
 DEFAULT_MANUAL_PULSE_SEC: float = 0.75    # 750 ms floor manual rollout pulse
-DEFAULT_APPROACH_PULSE_SEC: float = 0.15  # 150 ms forward pulse
+DEFAULT_APPROACH_PULSE_SEC: float = 0.50  # 500 ms forward pulse (~5.0 cm at 40% PWM)
+DEFAULT_SEARCH_TURN_PULSE_SEC: float = 1.00 # 1000 ms floor calibrated sector turn pulse (30 deg at 40% PWM)
+DEFAULT_CENTERING_TURN_PULSE_SEC: float = 0.25 # 250 ms optical alignment micro turn pulse (~6-8 deg at 40% PWM)
 DEFAULT_SETTLING_DELAY_SEC: float = 0.08  # 80 ms pause between pulses
 DEFAULT_SEARCH_SCAN_SEC: float = 12.0     # Default open-loop 360 scan duration
+DEFAULT_MISSION_TIMEOUT_SEC: float = 60.0 # 60 s maximum search & approach duration
+DEFAULT_SENSOR_STALENESS_SEC: float = 0.80 # 800 ms max age for valid ultrasonic reading
+DEFAULT_MIN_CONFIRMATIONS: int = 2        # 2 consecutive frames for target confirmation
 
 # ==============================================================================
 # Ultrasonic Distance Thresholds (Centimeters)
 # ==============================================================================
 MIN_ULTRASONIC_DISTANCE_CM: float = 2.0    # Physical sensor blind zone floor (<2cm is blind)
-TARGET_STOP_DISTANCE_CM: float = 30.0     # Provisional target stop in WARNING band; calibrate on chassis
+TARGET_STOP_DISTANCE_CM: float = 25.0     # Calibrated target standoff in 20-25 cm band
 CRITICAL_OBSTACLE_DISTANCE_CM: float = 15.0 # Emergency stop threshold (all motion blocked)
 BLOCKED_OBSTACLE_DISTANCE_CM: float = 25.0  # Forward motion blocked threshold
 WARNING_OBSTACLE_DISTANCE_CM: float = 50.0  # Speed throttling warning threshold
@@ -76,7 +81,7 @@ CAMERA_FPS: int = 15
 
 YOLO_INPUT_WIDTH: int = 320
 YOLO_INPUT_HEIGHT: int = 320
-YOLO_CONFIDENCE_THRESHOLD: float = 0.25
+YOLO_CONFIDENCE_THRESHOLD: float = 0.20
 YOLO_NMS_THRESHOLD: float = 0.45
 
 DEADBAND_PIXELS: int = 40                 # Centering deadband (+/- 40 px around x=320)

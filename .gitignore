@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .robot_token
+*.log
+*.bak*
+*.before_*
+robot_runtime.log
+
