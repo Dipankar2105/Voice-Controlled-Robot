@@ -410,3 +410,179 @@ def test_camera_owner_stop_releases_backend_handle():
     assert backend.is_opened() is False
     assert backend.release_call_count == 1
     owner.release()
+
+
+def test_camera_candidate_discovery_and_fallback():
+    """Verify that if configured index 0 fails, alternative candidate index is opened, and dummy nodes are rejected."""
+    import cv2
+    from unittest.mock import MagicMock, patch
+    from app.vision.camera import OpenCVCameraBackend
+
+    backend = OpenCVCameraBackend(device_index=0, width=640, height=480, fps=15)
+    # Patch candidate discovery to return [0, 1]
+    backend._find_candidate_indices = lambda: [0, 1]
+
+    # Device 0 fails to open; Device 1 opens and provides a valid frame
+    mock_cap0 = MagicMock()
+    mock_cap0.isOpened.return_value = False
+
+    mock_cap1 = MagicMock()
+    mock_cap1.isOpened.return_value = True
+    valid_test_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    mock_cap1.read.return_value = (True, valid_test_frame)
+
+    def fake_video_capture(dev_idx, *args, **kwargs):
+        if dev_idx == 0:
+            return mock_cap0
+        elif dev_idx == 1:
+            return mock_cap1
+        m = MagicMock()
+        m.isOpened.return_value = False
+        return m
+
+    with patch.object(cv2, "VideoCapture", side_effect=fake_video_capture):
+        success = backend.open()
+        assert success is True
+        assert backend.device_index == 1
+        assert backend.is_opened() is True
+        # Handle for failed index 0 was released
+        assert mock_cap0.release.call_count >= 1
+
+    backend.release()
+    assert mock_cap1.release.call_count >= 1
+
+
+def test_camera_recovery_requires_fresh_frame_before_operational():
+    """Recovery reopens backend but does NOT mark operational until a verified fresh frame arrives."""
+    class RecoveryMockBackend(MockCameraBackend):
+        def __init__(self):
+            super().__init__()
+            self.allow_read = True
+
+        def read(self):
+            self.read_call_count += 1
+            if not self.allow_read:
+                return False, None
+            return True, np.zeros((480, 640, 3), dtype=np.uint8)
+
+    backend = RecoveryMockBackend()
+    owner = CameraOwner(
+        backend=backend,
+        max_consecutive_drops=2,
+        max_recovery_attempts=3,
+        recovery_backoff_sec=0.01,
+    )
+    owner.start()
+
+    # Wait until initially operational
+    deadline = time.monotonic() + 0.5
+    while not owner.is_operational and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert owner.is_operational is True
+
+    # Simulate USB disconnect: read fails
+    backend.allow_read = False
+    time.sleep(0.15)
+    # Consecutive drops triggered recovery
+    assert owner.is_operational is False
+    assert owner._recovery_attempts >= 1
+
+    # Verify that before read succeeds again, camera is NOT operational
+    assert owner.capture_frame() is None
+
+    # Now USB reconnects: read succeeds
+    backend.allow_read = True
+    deadline = time.monotonic() + 0.5
+    while not owner.is_operational and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert owner.is_operational is True
+    assert owner._recovery_attempts == 0  # Reset only after genuine frame
+    assert owner.capture_frame() is not None
+    owner.release()
+
+
+def test_camera_disconnect_clears_old_frame():
+    """When camera drops frames / disconnects, old frames are cleared and never returned."""
+    backend = MockCameraBackend()
+    owner = CameraOwner(backend=backend, max_consecutive_drops=2)
+    owner.start()
+
+    deadline = time.monotonic() + 0.5
+    while not owner.is_operational and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert owner.capture_frame() is not None
+
+    # Inject repeated failures
+    class DisconnectedBackend(MockCameraBackend):
+        def read(self):
+            return False, None
+
+    owner.backend = DisconnectedBackend()
+    time.sleep(0.15)
+
+    assert owner.is_operational is False
+    assert owner.capture_frame() is None
+    owner.release()
+
+
+def test_camera_failure_isolation_from_voice_and_runtime_status():
+    """Camera failure does not interrupt voice worker; runtime status reflects degraded camera."""
+    from app.hardware.mock_hardware import MockAudioSource, MockSpeechRecognizer, MockDistanceSensor
+    from app.runtime import RobotRuntime, LifecycleState
+    from app.status import SubsystemStatus
+
+    class DynamicallyFailingCamera(MockCameraBackend):
+        def __init__(self):
+            super().__init__()
+            self.should_fail = False
+
+        def read(self):
+            self.read_call_count += 1
+            if self.should_fail:
+                return False, None
+            return True, np.zeros((480, 640, 3), dtype=np.uint8)
+
+    cam_backend = DynamicallyFailingCamera()
+    camera_owner = CameraOwner(
+        backend=cam_backend,
+        max_consecutive_drops=2,
+        max_recovery_attempts=1,
+        recovery_backoff_sec=0.01,
+    )
+
+    audio = MockAudioSource()
+    speech = MockSpeechRecognizer()
+    sensor = MockDistanceSensor(initial_distance_cm=80.0)
+
+    runtime = RobotRuntime(
+        camera=camera_owner,
+        audio_source=audio,
+        speech_recognizer=speech,
+        distance_sensor=sensor,
+    )
+    # Starts successfully while camera delivers initial frame
+    runtime.start()
+    assert runtime.lifecycle_state == LifecycleState.RUNNING
+
+    # Now camera fails mid-run
+    cam_backend.should_fail = True
+
+    # Wait for camera to exhaust recovery and hit terminal fault
+    deadline = time.monotonic() + 1.0
+    while not camera_owner.has_terminal_fault and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert camera_owner.has_terminal_fault is True
+    # Runtime should still have SpeechWorker and DistanceWorker alive
+    worker_health = runtime.check_worker_threads_alive()
+    assert worker_health["SpeechWorker"] is True
+    assert worker_health["DistanceWorker"] is True
+
+    # Voice command dispatch still works
+    speech.queue_utterance("stop")
+    time.sleep(0.1)
+    telemetry = runtime.get_telemetry()
+    assert "CAMERA_FAILURE" in telemetry["messages"]
+
+    runtime.stop()

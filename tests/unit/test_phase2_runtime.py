@@ -17,7 +17,12 @@ from app.config import (
     load_config_from_dict,
 )
 from app.constants import ExecutionMode, FaultCode
-from app.hardware.interfaces import ObstacleState
+from app.hardware.interfaces import (
+    DistanceSensorInterface,
+    MotorControllerInterface,
+    ObstacleState,
+    UltrasonicReading,
+)
 from app.hardware.mock_hardware import (
     MockAudioSource,
     MockCamera,
@@ -197,3 +202,74 @@ def test_runtime_unhealthy_on_critical_obstacle():
     assert not health.is_healthy  # Unhealthy because obstacle is critical
 
     runtime.cleanup()
+
+
+def test_real_hardware_ultrasonic_startup_failure_diagnostic_message(monkeypatch):
+    """When ultrasonic sensor returns only FAULT on REAL_HARDWARE startup, raise detailed diagnostic error."""
+    import platform
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+
+    class FakeMotor(MotorControllerInterface):
+        def __init__(self):
+            self._enabled = False
+            self._speeds = (0.0, 0.0)
+        @property
+        def is_enabled(self):
+            return self._enabled
+        @property
+        def current_speeds(self):
+            return self._speeds
+        def initialize(self): pass
+        def set_speeds(self, left, right): self._speeds = (left, right)
+        def stop(self): self._speeds = (0.0, 0.0)
+        def enable(self, enabled=True): self._enabled = enabled
+        def cleanup(self): pass
+
+    class FaultyDistanceSensor(DistanceSensorInterface):
+        def initialize(self): pass
+        def start(self): pass
+        def stop(self): pass
+        def get_reading(self): return UltrasonicReading.create_fault()
+        def sample_distance_cm(self): return UltrasonicReading.create_fault()
+
+    cfg = AppConfig(mode=ExecutionMode.REAL_HARDWARE)
+    fake_sensor = FaultyDistanceSensor()
+    fake_motors = FakeMotor()
+
+    runtime = RobotRuntime(
+        config=cfg,
+        motor_controller=fake_motors,
+        distance_sensor=fake_sensor,
+    )
+    runtime._state = LifecycleState.INITIALIZED
+
+    with pytest.raises(RuntimeError) as exc_info:
+        runtime.start()
+
+    err = str(exc_info.value)
+    assert "Ultrasonic sensor failed startup readiness check on subsystem 'ultrasonic'" in err
+    assert "TRIG BCM 23, ECHO BCM 24" in err
+    assert "within 3.0s timeout" in err
+    assert "Motors remain disabled for physical safety" in err
+    # Verify motors were never enabled
+    assert fake_motors.is_enabled is False
+    assert runtime.lifecycle_state == LifecycleState.STOPPED
+
+
+def test_runtime_worker_thread_death_detection_and_unhealthy():
+    """If a background worker thread terminates unexpectedly, system health marks unhealthy."""
+    runtime = RobotRuntime()
+    runtime.start()
+    assert runtime.get_health().is_healthy is True
+
+    # Simulate SpeechWorker dying unexpectedly
+    runtime._speech_thread = None
+    worker_status = runtime.check_worker_threads_alive()
+    assert worker_status["SpeechWorker"] is False
+    assert runtime.get_health().is_healthy is False
+
+    telemetry = runtime.get_telemetry()
+    assert telemetry["health"]["is_healthy"] is False
+    assert "WORKER_FAILURE" in telemetry["messages"]
+
+    runtime.stop()

@@ -178,6 +178,11 @@ def test_grammar_vocabulary_coverage():
     assert "halt" in tokens
     assert "forward" in tokens
     assert "backward" in tokens
+    assert "move backward" in tokens
+    assert "backwards" in tokens
+    assert "reverse" in tokens
+    # Ensure misspelled typo 'backwad' is excluded
+    assert "backwad" not in tokens
     assert "turn left" in tokens
     assert "turn right" in tokens
 
@@ -321,4 +326,35 @@ def test_vosk_recognizer_close_and_resource_cleanup():
     assert recognizer._vosk is None
     assert recognizer.get_result() == ""
     assert recognizer.get_partial_result() == ""
+
+
+def test_microphone_overflow_diagnostics():
+    """Verify that driver input overflow and internal queue overrun are accurately counted and distinguishable."""
+    source = MicrophoneAudioSource(max_buffered_chunks=3)
+    source._is_streaming = True
+
+    # 1. Simulate driver-level input overflow status
+    class MockStatus:
+        input_overflow = True
+        def __str__(self):
+            return "input overflow"
+
+    dummy_samples = np.zeros(1024, dtype=np.int16)
+    source._audio_callback(dummy_samples, 1024, None, MockStatus())
+    assert source.driver_overflow_count == 1
+    assert source.queue_overflow_count == 0
+
+    # 2. Fill queue to max_buffered_chunks (5 minimum)
+    for _ in range(4):
+        source._audio_callback(dummy_samples, 1024, None, None)
+    # Queue now has 5 chunks (full). Next callback triggers queue overrun.
+    source._audio_callback(dummy_samples, 1024, None, None)
+    assert source.queue_overflow_count == 1
+    assert source.driver_overflow_count == 1
+
+    diag = source.get_diagnostics()
+    assert diag["driver_overflow_count"] == 1
+    assert diag["queue_overflow_count"] == 1
+    assert diag["last_overflow_time"] is not None
+    assert diag["queue_size"] == 5
 

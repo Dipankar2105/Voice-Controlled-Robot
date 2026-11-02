@@ -5,7 +5,12 @@
 **Platform:** Raspberry Pi 4 Model B (Debian GNU/Linux 6.18.50 aarch64)  
 **Host & Port:** `http://10.248.131.117:8000` / `http://127.0.0.1:8000`  
 **Operational Mode:** `REAL_HARDWARE`  
-**Overall Acceptance Gate:** **BENCH, GUI, VOICE PIPELINE & SOFTWARE ACCEPTED — PENDING SUPERVISED PHYSICAL FLOOR MOVEMENT (TEST 6A)**
+**Overall Acceptance Gate:** **SOFTWARE AUDIT REPAIRS ACCEPTED — HARDWARE STARTUP CURRENTLY BLOCKED PENDING PHYSICAL HC-SR04 SENSOR/WIRING REPAIR ON PI**
+
+> [!IMPORTANT]
+> **Forensic Audit & Status Addendum:**
+> Runtime logs confirm that subsequent startup in `REAL_HARDWARE` mode was blocked by a hardware-level failure: `RuntimeError: Ultrasonic sensor did not produce a valid fresh reading; motors remain disabled.` The sensor returned only FAULT readings during the startup window, correctly preventing motor activation under the safety contract.
+> Software-level repairs (Vosk grammar vocabulary typo removal, audio driver overflow diagnostics, camera candidate discovery and bounded recovery, worker thread health diagnostics, and startup diagnostics) are complete and verified with unit tests. Physical hardware acceptance is **PENDING** physical inspection of the HC-SR04 sensor, wiring, and voltage divider on the Raspberry Pi.
 
 ---
 

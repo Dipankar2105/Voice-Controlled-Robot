@@ -83,6 +83,8 @@ pip install -r requirements.txt
 ## 3. One-Command Startup & Launcher
 
 ### Single-Command Start (Linux / Raspberry Pi)
+> [!IMPORTANT]
+> `./start_robot.sh` executes the runtime server in **`REAL_HARDWARE` mode** by default. It requires execution on a physical Raspberry Pi ARM Linux board, access to BCM GPIO pins, and responsive hardware peripherals.
 ```bash
 chmod +x start_robot.sh
 ./start_robot.sh
@@ -95,11 +97,11 @@ start_robot.bat
 
 ### Direct CLI Commands
 ```bash
-# 1. Non-invasive preflight check (validates assets and config without hardware actuation)
+# 1. Non-invasive preflight check (validates static YAML config and model asset presence ONLY; does NOT prove physical hardware readiness or sensor responsiveness)
 python -m app.main --check-config
 
-# 2. Launch authoritative runtime server on default port 8000
-python -m app.main --serve
+# 2. Launch simulation runtime server on default port 8000
+python -m app.main --serve --mode SIMULATION
 
 # 3. Hardware mode requires an out-of-band operator token (24+ characters).
 export ROBOT_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -223,16 +225,38 @@ See detailed step-by-step procedures in [docs/HARDWARE_ACCEPTANCE_GUIDE.md](docs
 
 ## 7. Verification Matrix: Physical vs Software Tested
 
+> [!NOTE]
+> Software repairs and unit test suites have been verified with 100% mock passing status. However, **post-repair physical on-robot verification on the Raspberry Pi has NOT yet been completed** and is pending physical sensor inspection.
+
 | Subsystem / Capability | Verification Status | Evidence / Notes |
 |---|---|---|
-| **Motor Primitives** (`FORWARD`, `REVERSE`, `TURN_LEFT`, `TURN_RIGHT`) | **Physically Verified** | Verified on live hardware on the floor at 50% PWM. Interface & pins frozen. |
-| **Logitech C270 Camera** | **Physically Verified** | Real frame capture verified (10/10 frames, 1.30 ms latency, 640x480 @ 15 FPS). |
-| **YOLO ONNX Object Detector** | **Physically Verified** | Real ONNX session inference verified (26 classes, 169 ms / 5.9 FPS on Pi CPU). |
-| **Logitech C270 Microphone** | **Physically Verified** | Real ALSA stream captured (16 kHz mono 16-bit PCM, RMS signal verified). |
-| **Vosk Offline Speech Engine** | **Physically Verified** | Real Kaldi model loaded (1,146 robotics grammar phrases, live decode verified). |
-| **HC-SR04 Ultrasonic Distance** | **Physically Verified** | Real sensor ping verified on Pi (88.6 cm reading, pull-down active, valid state). |
-| **End-to-End Navigation & FSM** | **Software Verified (288 tests)** | State transitions, deadband centering, standoff arrival, obstacle aborts verified. |
-| **Floor Autonomous Mission** | **Pending Operator Supervision** | Real target approach on floor with elevated pre-check awaiting user approval. |
+| **Motor Primitives** (`FORWARD`, `REVERSE`, `TURN_LEFT`, `TURN_RIGHT`) | **Bench/Floor Verified (Prior Session)** | Verified in earlier hardware session on floor at 50% PWM. Safety interlocks remain enforced. |
+| **Logitech C270 Camera** | **Software Hardened (Pending Pi Retest)** | Candidate fallback, permission detection, and bounded retry recovery implemented and verified with mocks. Physical USB cable and re-enumeration retest pending on Pi. |
+| **YOLO ONNX Object Detector** | **Model & Inference Verified** | ONNX Runtime session inference verified (26 classes, 169 ms / 5.9 FPS on Pi CPU, asset checksums verified). |
+| **Logitech C270 Microphone** | **Software Hardened (Pending Pi Retest)** | Driver input overflow counting and non-blocking callback diagnostics added. Audio capture was verified in prior session. |
+| **Vosk Offline Speech Engine** | **Software Verified & Cleaned** | Misspelled `"backwad"` vocabulary typo removed; valid grammar generation and Kaldi model load verified. |
+| **HC-SR04 Ultrasonic Distance** | **HARDWARE FAULT PENDING PHYSICAL REPAIR** | Startup check correctly halts motors because sensor returns FAULT readings on Pi. Wiring/divider inspection required before live start. |
+| **Worker Thread Health Monitoring** | **Software Verified** | Real-time thread liveness tracking and fault reporting verified; unhandled worker death flags system as degraded. |
+| **End-to-End Navigation & FSM** | **Software Verified (All Unit Tests Passing)** | State transitions, deadband centering, standoff arrival, obstacle aborts verified using mocks. |
+| **Full Robot Physical Acceptance** | **PENDING PHYSICAL PI VERIFICATION** | Requires physical HC-SR04 wiring repair, live ultrasonic ping check, and elevated motor pre-check. |
+
+---
+
+## 7.1. Post-Repair Physical Verification Checklist (Raspberry Pi)
+
+Before running `./start_robot.sh` in `REAL_HARDWARE` mode on the Raspberry Pi:
+1. **HC-SR04 Physical Inspection (Priority 1):**
+   - Check TRIG wire continuity from Pi BCM 23 (Pin 16) to sensor TRIG.
+   - Check ECHO wire continuity from sensor ECHO through the $1\,\text{k}\Omega / 2\,\text{k}\Omega$ voltage divider to Pi BCM 24 (Pin 18).
+   - Check 5V power and GND connections.
+   - Test directly: `python scripts/live_ultrasonic.py` (must show valid readings around room distance, not FAULT).
+2. **Logitech C270 USB Connection (Priority 2):**
+   - Reseat USB cable in Pi USB 3.0 / 2.0 port. Provide mechanical strain relief to prevent vibration disconnects.
+   - Test directly: `python scripts/diagnose_camera.py` and `python scripts/diagnose_microphone.py`.
+3. **Elevated Wheel Commissioning (Priority 3):**
+   - Elevate all four wheels off the floor.
+   - Verify emergency power cutoff switch is within reach.
+   - Run `python scripts/commission_hardware.py --interactive`.
 
 ---
 

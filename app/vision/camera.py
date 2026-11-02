@@ -73,6 +73,15 @@ class OpenCVCameraBackend:
             cap = None
 
             for dev_idx in candidate_indices:
+                dev_path = f"/dev/video{dev_idx}"
+                if sys.platform.startswith("linux") and os.path.exists(dev_path):
+                    if not os.access(dev_path, os.R_OK | os.W_OK):
+                        logger.warning(
+                            "Cannot open video device %s: Permission denied (ensure user in 'video' group and device not locked); skipping.",
+                            dev_path,
+                        )
+                        continue
+
                 logger.info(
                     "Opening camera device index %d (%dx%d @ %d FPS)...",
                     dev_idx,
@@ -103,8 +112,29 @@ class OpenCVCameraBackend:
                         cap = None
 
                 if cap is not None and cap.isOpened():
-                    self.device_index = dev_idx
-                    break
+                    # Configure properties before validation read
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                        cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    except Exception as exc:
+                        logger.warning("Error configuring camera properties on index %d: %s", dev_idx, exc)
+
+                    # Validate with a test read to ensure this is an active optical sensor,
+                    # not a platform metadata or codec node.
+                    try:
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None and getattr(test_frame, "size", 0) > 0:
+                            self.device_index = dev_idx
+                            break
+                        else:
+                            logger.warning(
+                                "Camera candidate index %d opened but failed validation frame read (likely metadata node); releasing.",
+                                dev_idx,
+                            )
+                    except Exception as exc:
+                        logger.warning("Validation frame read error on index %d: %s", dev_idx, exc)
 
                 if cap is not None:
                     try:
@@ -122,15 +152,6 @@ class OpenCVCameraBackend:
                 logger.error("Failed to open camera device index %d.", self.device_index)
                 self._cap = None
                 return False
-
-            # Configure properties
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                cap.set(cv2.CAP_PROP_FPS, self.fps)
-            except Exception as exc:
-                logger.warning("Error configuring camera properties: %s", exc)
 
             self._cap = cap
             return True
@@ -267,6 +288,8 @@ class CameraOwner(CameraInterface):
         """Controlled recovery policy when consecutive frame drops exceed threshold."""
         if self._recovery_attempts >= self.max_recovery_attempts:
             self._has_terminal_fault = True
+            self._is_running = False
+            self._is_operational = False
             logger.error(
                 "Camera recovery budget exhausted (%d/%d attempts). Entering terminal fault state.",
                 self._recovery_attempts,
@@ -292,12 +315,22 @@ class CameraOwner(CameraInterface):
             opened = self.backend.open()
             if opened:
                 self._consecutive_drops = 0
-                logger.info("Camera recovery successful; backend reopened.")
+                logger.info(
+                    "Camera backend reopened during recovery (attempt %d/%d); awaiting verified fresh frame.",
+                    self._recovery_attempts,
+                    self.max_recovery_attempts,
+                )
                 return True
             else:
-                logger.warning("Camera recovery reopen failed.")
+                logger.warning(
+                    "Camera recovery reopen failed on attempt %d/%d.",
+                    self._recovery_attempts,
+                    self.max_recovery_attempts,
+                )
                 if self._recovery_attempts >= self.max_recovery_attempts:
                     self._has_terminal_fault = True
+                    self._is_running = False
+                    self._is_operational = False
                     try:
                         self.backend.release()
                     except Exception:
@@ -334,7 +367,14 @@ class CameraOwner(CameraInterface):
                         self._latest_timestamp = now
                         self._consecutive_drops = 0
                         self._total_frames_captured += 1
-                        self._is_operational = True
+                        if not self._is_operational:
+                            self._is_operational = True
+                            if self._recovery_attempts > 0:
+                                logger.info(
+                                    "Camera genuine recovery confirmed; fresh valid frame received (resetting recovery attempts from %d to 0).",
+                                    self._recovery_attempts,
+                                )
+                                self._recovery_attempts = 0
                     else:
                         logger.warning(
                             "Frame dimension mismatch: got %dx%d, expected %dx%d",
@@ -367,6 +407,7 @@ class CameraOwner(CameraInterface):
                 self._attempt_recovery()
             if self._has_terminal_fault:
                 self._is_running = False
+                self._is_operational = False
 
     def capture_frame(self) -> Optional[np.ndarray]:
         """Return the latest fresh optical frame as a uint8 BGR array [H, W, 3].
@@ -382,7 +423,7 @@ class CameraOwner(CameraInterface):
                 return None, 0.0
 
             age = time.time() - self._latest_timestamp
-            if age > self.max_staleness_sec:
+            if age > self.max_staleness_sec or age < 0:
                 logger.warning(
                     "Captured frame is stale (age %.3fs > threshold %.3fs). Dropping.",
                     age,
@@ -391,6 +432,20 @@ class CameraOwner(CameraInterface):
                 return None, self._latest_timestamp
 
             return self._latest_frame.copy(), self._latest_timestamp
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Return diagnostic snapshot of camera operational state and error metrics."""
+        with self._lock:
+            return {
+                "is_running": self._is_running,
+                "is_operational": self._is_operational,
+                "has_terminal_fault": self._has_terminal_fault,
+                "recovery_attempts": self._recovery_attempts,
+                "consecutive_drops": self._consecutive_drops,
+                "total_frames_captured": self._total_frames_captured,
+                "latest_timestamp": self._latest_timestamp,
+                "device_index": getattr(self.backend, "device_index", None),
+            }
 
     def stop(self) -> None:
         """Stop background capture worker thread and release backend camera hardware."""

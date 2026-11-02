@@ -43,7 +43,6 @@ REVIEWED_COMMAND_VOCABULARY = [
     "backwards",
     "move backwards",
     "go backwards",
-    "backwad",
     "back",
     "go back",
     "move back",

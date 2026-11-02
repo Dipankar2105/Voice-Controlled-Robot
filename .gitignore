@@ -7,4 +7,7 @@ __pycache__/
 *.bak*
 *.before_*
 robot_runtime.log
-
+.env
+*.swp
+*.swo
+.DS_Store

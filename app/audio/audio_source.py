@@ -123,10 +123,37 @@ class MicrophoneAudioSource(AudioSourceInterface):
         self._stream: Any = None
         self._lock = threading.Lock()
         self._active_device_index: Optional[int] = None
+        self._driver_overflow_count: int = 0
+        self._queue_overflow_count: int = 0
+        self._last_overflow_time: Optional[float] = None
+        self._last_status_str: Optional[str] = None
 
     @property
     def active_device_index(self) -> Optional[int]:
         return self._active_device_index
+
+    @property
+    def driver_overflow_count(self) -> int:
+        return self._driver_overflow_count
+
+    @property
+    def queue_overflow_count(self) -> int:
+        return self._queue_overflow_count
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Return diagnostic metrics distinguishing driver overflow vs queue overrun."""
+        with self._lock:
+            return {
+                "is_streaming": self._is_streaming,
+                "is_closed": self._is_closed,
+                "active_device_index": self._active_device_index,
+                "driver_overflow_count": self._driver_overflow_count,
+                "queue_overflow_count": self._queue_overflow_count,
+                "last_overflow_time": self._last_overflow_time,
+                "last_status_str": self._last_status_str,
+                "queue_size": self._audio_queue.qsize(),
+                "max_buffered_chunks": self.max_buffered_chunks,
+            }
 
     @property
     def is_streaming(self) -> bool:
@@ -144,7 +171,19 @@ class MicrophoneAudioSource(AudioSourceInterface):
             return
 
         if status:
-            logger.warning("Sounddevice status reported: %s", status)
+            status_str = str(status)
+            self._last_status_str = status_str
+            is_overflow = getattr(status, "input_overflow", False) or ("overflow" in status_str.lower())
+            if is_overflow:
+                self._driver_overflow_count += 1
+                self._last_overflow_time = time.time()
+                logger.warning(
+                    "Sounddevice ALSA/PortAudio input overflow reported (dropped incoming samples, count=%d): %s",
+                    self._driver_overflow_count,
+                    status_str,
+                )
+            else:
+                logger.warning("Sounddevice status reported: %s", status_str)
 
         try:
             if indata is None or indata.size == 0:
@@ -162,12 +201,19 @@ class MicrophoneAudioSource(AudioSourceInterface):
             try:
                 self._audio_queue.put_nowait(pcm_bytes)
             except queue.Full:
+                self._queue_overflow_count += 1
+                self._last_overflow_time = time.time()
                 # Buffer overrun: drop oldest chunk to maintain real-time latency
                 try:
                     self._audio_queue.get_nowait()
                     self._audio_queue.put_nowait(pcm_bytes)
                 except Exception:
                     pass
+                if self._queue_overflow_count == 1 or self._queue_overflow_count % 50 == 0:
+                    logger.warning(
+                        "Microphone audio queue full (internal buffer overrun, %d dropped chunks); consumer worker may be lagging.",
+                        self._queue_overflow_count,
+                    )
         except Exception as exc:
             logger.error("Exception in audio stream callback: %s", exc)
 

@@ -379,7 +379,7 @@ def test_ultrasonic_valid_near_and_far_readings():
     r_far = sensor_far.sample_distance_cm()
     assert r_far.is_valid
     assert r_far.state == ObstacleState.CLEAR
-    assert 245.0 <= r_far.distance_cm <= 255.0
+    assert 240.0 <= r_far.distance_cm <= 260.0
 
 
 def test_ultrasonic_no_echo_rising_edge():

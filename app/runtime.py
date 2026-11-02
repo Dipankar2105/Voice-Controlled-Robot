@@ -125,6 +125,7 @@ class RobotRuntime:
         self._mission_thread: Optional[threading.Thread] = None
         self._distance_thread: Optional[threading.Thread] = None
         self._vision_thread: Optional[threading.Thread] = None
+        self._dead_workers: Dict[str, float] = {}
 
         # Cached telemetry state for read-only status reporting
         self._cached_distance_reading: Optional[UltrasonicReading] = None
@@ -369,7 +370,33 @@ class RobotRuntime:
                 if self.config.mode == ExecutionMode.REAL_HARDWARE and (
                     reading is None or reading.state == ObstacleState.FAULT
                 ):
-                    raise RuntimeError("Ultrasonic sensor did not produce a valid fresh reading; motors remain disabled.")
+                    trig_pin = getattr(self.config.ultrasonic, "trig_pin", 23)
+                    echo_pin = getattr(self.config.ultrasonic, "echo_pin", 24)
+                    timeout_sec = 3.0
+                    now = time.time()
+                    if reading is None:
+                        diag_detail = "sensor returned no reading (initialization failure or communication exception)"
+                        status_str = "NONE"
+                    else:
+                        status_str = reading.state.value if hasattr(reading.state, "value") else str(reading.state)
+                        stale_thresh = getattr(self.distance_sensor, "stale_threshold_sec", 0.5)
+                        age = (now - reading.timestamp) if (reading.timestamp is not None) else 999.0
+                        if age > stale_thresh:
+                            diag_detail = f"stale reading (age {age:.3f}s > threshold {stale_thresh:.3f}s; worker produced no fresh echoes)"
+                        elif reading.raw_pulse_sec is None:
+                            diag_detail = "no echo pulse received within timeout (ECHO pin remained LOW or disconnected)"
+                        elif reading.raw_pulse_sec < 0.000115:
+                            diag_detail = f"sub-millisecond noise pulse ({reading.raw_pulse_sec*1e6:.1f}us) rejected"
+                        else:
+                            diag_detail = f"fault state with raw_distance_cm={reading.raw_distance_cm}"
+
+                    err_msg = (
+                        f"Ultrasonic sensor failed startup readiness check on subsystem 'ultrasonic' "
+                        f"(TRIG BCM {trig_pin}, ECHO BCM {echo_pin}) within {timeout_sec:.1f}s timeout. "
+                        f"Last sensor status: {status_str} ({diag_detail}). Motors remain disabled for physical safety."
+                    )
+                    logger.error(err_msg)
+                    raise RuntimeError(err_msg)
 
             if self.audio_source:
                 self.audio_source.start_stream()
@@ -438,151 +465,214 @@ class RobotRuntime:
 
     def _distance_worker(self) -> None:
         """Continuously update cached ultrasonic reading to ensure read-only status calls."""
-        while not self._stop_event.is_set():
-            if self.distance_sensor and self._state == LifecycleState.RUNNING:
-                try:
-                    reading = self.distance_sensor.get_reading()
-                    self._cached_distance_reading = reading
-                except Exception as exc:
-                    logger.debug("Distance worker sample error; invalidating cached reading: %s", exc)
-                    self._cached_distance_reading = UltrasonicReading.create_fault()
+        try:
+            while not self._stop_event.is_set():
+                if self.distance_sensor and self._state == LifecycleState.RUNNING:
+                    try:
+                        reading = self.distance_sensor.get_reading()
+                        self._cached_distance_reading = reading
+                    except Exception as exc:
+                        logger.debug("Distance worker sample error; invalidating cached reading: %s", exc)
+                        self._cached_distance_reading = UltrasonicReading.create_fault()
 
-            # Joystick watchdog: ensure motors halt if joystick heartbeat lease expires
-            if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
-                with self._command_lock:
-                    if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
-                        self._joystick_active = False
-                        if self.motors:
-                            try:
-                                self.motors.stop()
-                            except Exception:
-                                pass
-                        if self.fsm and self.fsm.state == RobotState.MANUAL_MOVEMENT:
-                            self.fsm._transition_to(RobotState.IDLE_LISTENING, "Joystick watchdog lease expired; motors stopped.")
-                        logger.info("Joystick watchdog lease expired; motors safely stopped.")
+                # Joystick watchdog: ensure motors halt if joystick heartbeat lease expires
+                if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
+                    with self._command_lock:
+                        if self._joystick_active and (time.time() - self._last_joystick_time) > self._joystick_watchdog_sec:
+                            self._joystick_active = False
+                            if self.motors:
+                                try:
+                                    self.motors.stop()
+                                except Exception:
+                                    pass
+                            if self.fsm and self.fsm.state == RobotState.MANUAL_MOVEMENT:
+                                self.fsm._transition_to(RobotState.IDLE_LISTENING, "Joystick watchdog lease expired; motors stopped.")
+                            logger.info("Joystick watchdog lease expired; motors safely stopped.")
 
-            time.sleep(0.08)  # ~12.5 Hz refresh
+                time.sleep(0.08)  # ~12.5 Hz refresh
+        except Exception as exc:
+            logger.critical("Uncaught exception in DistanceWorker: %s", exc, exc_info=True)
+        finally:
+            if not self._stop_event.is_set() and self._state == LifecycleState.RUNNING:
+                logger.critical("DistanceWorker thread terminated unexpectedly while runtime is RUNNING! Subsystem health degraded.")
+                self._dead_workers["DistanceWorker"] = time.time()
+                self._subsystem_statuses["sensor"] = SubsystemStatus.FAULT
 
     def _mission_worker(self) -> None:
         """Periodically advance active search/centering/approach navigation state machine."""
-        while not self._stop_event.is_set():
-            if self.fsm and self.fsm.state in (
-                RobotState.SEARCHING,
-                RobotState.TARGET_CONFIRMED,
-                RobotState.CENTERING,
-                RobotState.APPROACHING,
-            ):
-                if not self._joystick_active and not self._is_executing_command:
-                    with self._command_lock:
-                        if (
-                            not self._joystick_active
-                            and not self._is_executing_command
-                            and not self._stop_event.is_set()
-                            and self.fsm
-                            and self.fsm.state in (
-                                RobotState.SEARCHING,
-                                RobotState.TARGET_CONFIRMED,
-                                RobotState.CENTERING,
-                                RobotState.APPROACHING,
-                            )
-                        ):
-                            try:
-                                self.fsm.step_mission()
-                            except Exception as exc:
-                                logger.error("Error stepping mission: %s", exc)
-            time.sleep(0.05)  # 20 Hz tick
+        try:
+            while not self._stop_event.is_set():
+                if self.fsm and self.fsm.state in (
+                    RobotState.SEARCHING,
+                    RobotState.TARGET_CONFIRMED,
+                    RobotState.CENTERING,
+                    RobotState.APPROACHING,
+                ):
+                    if not self._joystick_active and not self._is_executing_command:
+                        with self._command_lock:
+                            if (
+                                not self._joystick_active
+                                and not self._is_executing_command
+                                and not self._stop_event.is_set()
+                                and self.fsm
+                                and self.fsm.state in (
+                                    RobotState.SEARCHING,
+                                    RobotState.TARGET_CONFIRMED,
+                                    RobotState.CENTERING,
+                                    RobotState.APPROACHING,
+                                )
+                            ):
+                                try:
+                                    self.fsm.step_mission()
+                                except Exception as exc:
+                                    logger.error("Error stepping mission: %s", exc)
+                time.sleep(0.05)  # 20 Hz tick
+        except Exception as exc:
+            logger.critical("Uncaught exception in MissionWorker: %s", exc, exc_info=True)
+        finally:
+            if not self._stop_event.is_set() and self._state == LifecycleState.RUNNING:
+                logger.critical("MissionWorker thread terminated unexpectedly while runtime is RUNNING! Subsystem health degraded.")
+                self._dead_workers["MissionWorker"] = time.time()
 
     def _speech_worker(self) -> None:
         """Continuously drain audio chunks, decode voice transcripts, and dispatch commands."""
-        while not self._stop_event.is_set():
-            if not self.audio_source or not self.speech_recognizer:
-                time.sleep(0.05)
-                continue
-
-            try:
-                chunk = self.audio_source.read_chunk()
-                if not chunk:
-                    time.sleep(0.01)
+        try:
+            while not self._stop_event.is_set():
+                if not self.audio_source or not self.speech_recognizer:
+                    time.sleep(0.05)
                     continue
 
-                accepted = False
-                if hasattr(self.speech_recognizer, "accept_waveform"):
-                    accepted = self.speech_recognizer.accept_waveform(chunk)
-                elif hasattr(self.speech_recognizer, "accept_audio"):
-                    accepted = self.speech_recognizer.accept_audio(chunk)
+                try:
+                    chunk = self.audio_source.read_chunk()
+                    if not chunk:
+                        time.sleep(0.01)
+                        continue
 
-                if accepted:
-                    raw_text = self.speech_recognizer.get_result()
-                    if raw_text and raw_text.strip():
-                        logger.info("Vosk final recognized transcript: '%s'", raw_text)
-                        self._current_partial_transcript = ""
-                        self.dispatch_text_command(raw_text)
-                else:
-                    if hasattr(self.speech_recognizer, "get_partial_result"):
-                        partial = self.speech_recognizer.get_partial_result()
-                        if partial and partial.strip():
-                            self._current_partial_transcript = partial.strip()
-                            # Immediate safety stop preemption from partial transcript
-                            if self.command_parser:
-                                partial_cmd = self.command_parser.parse(partial, is_partial=True)
-                                if partial_cmd.action in (
-                                    CommandAction.EMERGENCY_STOP,
-                                    CommandAction.STOP,
-                                    CommandAction.CANCEL_SEARCH,
-                                    CommandAction.STOP_SCANNING,
-                                ):
-                                    logger.warning("Immediate safety preemption from partial transcript: '%s'", partial)
-                                    self.dispatch_text_command(partial, is_partial=True)
-                                    if hasattr(self.speech_recognizer, "reset"):
-                                        try:
-                                            self.speech_recognizer.reset()
-                                        except Exception:
-                                            pass
-            except Exception as exc:
-                logger.error("Error in speech worker: %s", exc)
-                time.sleep(0.05)
+                    accepted = False
+                    if hasattr(self.speech_recognizer, "accept_waveform"):
+                        accepted = self.speech_recognizer.accept_waveform(chunk)
+                    elif hasattr(self.speech_recognizer, "accept_audio"):
+                        accepted = self.speech_recognizer.accept_audio(chunk)
+
+                    if accepted:
+                        raw_text = self.speech_recognizer.get_result()
+                        if raw_text and raw_text.strip():
+                            logger.info("Vosk final recognized transcript: '%s'", raw_text)
+                            self._current_partial_transcript = ""
+                            self.dispatch_text_command(raw_text)
+                    else:
+                        if hasattr(self.speech_recognizer, "get_partial_result"):
+                            partial = self.speech_recognizer.get_partial_result()
+                            if partial and partial.strip():
+                                self._current_partial_transcript = partial.strip()
+                                # Immediate safety stop preemption from partial transcript
+                                if self.command_parser:
+                                    partial_cmd = self.command_parser.parse(partial, is_partial=True)
+                                    if partial_cmd.action in (
+                                        CommandAction.EMERGENCY_STOP,
+                                        CommandAction.STOP,
+                                        CommandAction.CANCEL_SEARCH,
+                                        CommandAction.STOP_SCANNING,
+                                    ):
+                                        logger.warning("Immediate safety preemption from partial transcript: '%s'", partial)
+                                        self.dispatch_text_command(partial, is_partial=True)
+                                        if hasattr(self.speech_recognizer, "reset"):
+                                            try:
+                                                self.speech_recognizer.reset()
+                                            except Exception:
+                                                pass
+                except Exception as exc:
+                    logger.error("Error in speech worker loop: %s", exc)
+                    time.sleep(0.05)
+        except Exception as exc:
+            logger.critical("Uncaught exception in SpeechWorker: %s", exc, exc_info=True)
+        finally:
+            if not self._stop_event.is_set() and self._state == LifecycleState.RUNNING:
+                logger.critical("SpeechWorker thread terminated unexpectedly while runtime is RUNNING! Subsystem health degraded.")
+                self._dead_workers["SpeechWorker"] = time.time()
+                self._subsystem_statuses["speech"] = SubsystemStatus.FAULT
 
     def _vision_worker(self) -> None:
         """Background optical perception thread running periodic YOLO inference (~0.5 Hz during idle)."""
         detect_freq = getattr(self.config.vision, "detect_frequency_hz", 0.5)
         target_sleep = max(2.0, 1.0 / max(0.1, float(detect_freq)))
 
-        while not self._stop_event.is_set():
-            # If an autonomous mission is active, step_mission handles optical detection;
-            # pause background inference to eliminate duplicate model executions and reduce CPU load.
-            mission_active = (
-                self.fsm
-                and self.fsm.state in (
-                    RobotState.SEARCHING,
-                    RobotState.TARGET_CONFIRMED,
-                    RobotState.CENTERING,
-                    RobotState.APPROACHING,
+        try:
+            while not self._stop_event.is_set():
+                # Check camera health dynamically from camera diagnostics
+                if self.camera:
+                    if hasattr(self.camera, "has_terminal_fault") and self.camera.has_terminal_fault:
+                        self._subsystem_statuses["camera"] = SubsystemStatus.FAULT
+                        self._latest_detections = []
+                    elif hasattr(self.camera, "is_operational") and not self.camera.is_operational:
+                        self._subsystem_statuses["camera"] = SubsystemStatus.DEGRADED
+                        self._latest_detections = []
+                    elif hasattr(self.camera, "is_operational") and self.camera.is_operational:
+                        if self._subsystem_statuses.get("camera") != SubsystemStatus.READY:
+                            self._subsystem_statuses["camera"] = SubsystemStatus.READY
+
+                mission_active = (
+                    self.fsm
+                    and self.fsm.state in (
+                        RobotState.SEARCHING,
+                        RobotState.TARGET_CONFIRMED,
+                        RobotState.CENTERING,
+                        RobotState.APPROACHING,
+                    )
                 )
-            )
 
-            if (
-                not mission_active
-                and self.camera
-                and self.detector
-                and self._state == LifecycleState.RUNNING
-                and self._subsystem_statuses.get("camera") == SubsystemStatus.READY
-                and self._subsystem_statuses.get("detector") == SubsystemStatus.READY
-            ):
-                try:
-                    frame = None
-                    if hasattr(self.camera, "get_latest_frame_with_timestamp"):
-                        frame, _ = self.camera.get_latest_frame_with_timestamp()
-                    elif hasattr(self.camera, "capture_frame"):
-                        frame = self.camera.capture_frame()
+                if (
+                    not mission_active
+                    and self.camera
+                    and self.detector
+                    and self._state == LifecycleState.RUNNING
+                    and self._subsystem_statuses.get("camera") == SubsystemStatus.READY
+                    and self._subsystem_statuses.get("detector") == SubsystemStatus.READY
+                ):
+                    try:
+                        frame = None
+                        if hasattr(self.camera, "get_latest_frame_with_timestamp"):
+                            frame, _ = self.camera.get_latest_frame_with_timestamp()
+                        elif hasattr(self.camera, "capture_frame"):
+                            frame = self.camera.capture_frame()
 
-                    if frame is not None and hasattr(self.detector, "detect"):
-                        results = self.detector.detect(frame)
-                        self._latest_detections = results
-                        self._latest_detections_time = time.time()
-                except Exception as exc:
-                    logger.debug("Vision worker error: %s", exc)
+                        if frame is not None and hasattr(self.detector, "detect"):
+                            results = self.detector.detect(frame)
+                            self._latest_detections = results
+                            self._latest_detections_time = time.time()
+                        elif frame is None and (self.camera and not getattr(self.camera, "is_operational", True)):
+                            self._latest_detections = []
+                    except Exception as exc:
+                        logger.debug("Vision worker error: %s", exc)
 
-            time.sleep(target_sleep)
+                time.sleep(target_sleep)
+        except Exception as exc:
+            logger.critical("Uncaught exception in VisionWorker: %s", exc, exc_info=True)
+        finally:
+            if not self._stop_event.is_set() and self._state == LifecycleState.RUNNING:
+                logger.critical("VisionWorker thread terminated unexpectedly while runtime is RUNNING! Subsystem health degraded.")
+                self._dead_workers["VisionWorker"] = time.time()
+                self._subsystem_statuses["detector"] = SubsystemStatus.FAULT
+
+    def check_worker_threads_alive(self) -> Dict[str, bool]:
+        """Inspect operational liveness of background worker threads."""
+        threads = {
+            "DistanceWorker": self._distance_thread,
+            "MissionWorker": self._mission_thread,
+            "SpeechWorker": self._speech_thread,
+            "VisionWorker": self._vision_thread,
+        }
+        res: Dict[str, bool] = {}
+        for name, t in threads.items():
+            if t is None:
+                res[name] = not (self._state == LifecycleState.RUNNING)
+            else:
+                alive = t.is_alive()
+                res[name] = alive
+                if not alive and self._state == LifecycleState.RUNNING and not self._stop_event.is_set():
+                    if name not in self._dead_workers:
+                        self._dead_workers[name] = time.time()
+        return res
 
     def dispatch_text_command(
         self, raw_text: str, is_partial: bool = False
@@ -1059,12 +1149,21 @@ class RobotRuntime:
                 "error_reason": c.error_reason,
             }
 
+        worker_health = self.check_worker_threads_alive()
+        workers_all_alive = all(worker_health.values()) if (self._state == LifecycleState.RUNNING and not self._stop_event.is_set()) else True
+
+        if not workers_all_alive or bool(self._dead_workers):
+            messages.append("WORKER_FAILURE")
+            for dead_name in self._dead_workers:
+                messages.append(f"WORKER_DEAD_{dead_name.upper()}")
+
         is_healthy = (
             active_fault == FaultCode.OK.value
             and not estop_latched
             and self._state in (LifecycleState.INITIALIZED, LifecycleState.RUNNING)
             and sensor_healthy
             and obs_state not in (ObstacleState.CRITICAL.value, ObstacleState.FAULT.value, ObstacleState.OUT_OF_RANGE.value)
+            and workers_all_alive
         )
 
         # Determine high-level operating control mode
@@ -1149,6 +1248,10 @@ class RobotRuntime:
                 "safety_block_reason": block_reason,
             },
             "messages": messages,
+            "worker_health": {
+                "all_alive": workers_all_alive,
+                "dead_workers": list(self._dead_workers.keys()),
+            },
             "subsystems": {k: v.value for k, v in self._subsystem_statuses.items()},
         }
 
@@ -1168,11 +1271,15 @@ class RobotRuntime:
         dist_val = reading.distance_cm if (reading_fresh and reading and reading.is_valid) else None
         obs_state = reading.state if (reading_fresh and reading) else ObstacleState.FAULT
 
+        worker_health = self.check_worker_threads_alive()
+        workers_all_alive = all(worker_health.values()) if (self._state == LifecycleState.RUNNING and not self._stop_event.is_set()) else True
+
         is_healthy = (
             self._active_fault == FaultCode.OK
             and self._state in (LifecycleState.INITIALIZED, LifecycleState.RUNNING)
             and reading_fresh and reading is not None and reading.is_valid
             and obs_state not in (ObstacleState.CRITICAL, ObstacleState.FAULT, ObstacleState.OUT_OF_RANGE)
+            and workers_all_alive
         )
 
         return SystemHealth(
